@@ -1,0 +1,5 @@
+{
+  "name": "KABS - Quotation And Drawing System",
+  "description": "A production-ready, fully automated kitchen cabinet quotation system featuring AI extraction, NKBA normalization, and manufacturer-specific pricing engines.",
+  "requestFramePermissions": []
+}
