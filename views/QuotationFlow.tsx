@@ -4,7 +4,7 @@ import {
   UploadCloud, CheckCircle2, ChevronRight, FileOutput, 
   Settings2, DollarSign, Printer, ArrowRight, AlertCircle, Edit2, AlertTriangle, Info,
   ArrowLeft, Layers, Package, RefreshCw, AlertOctagon, Check, Tags, PenTool, Database, Server, Link2, DownloadCloud, FileText,
-  PaintBucket, Hammer, Shield, Grid3X3, Trash2, Calculator, Truck, User, Building2, MapPin
+  PaintBucket, Hammer, Shield, Grid3X3, Trash2, Calculator, Truck, User, Building2, MapPin, Plus
 } from 'lucide-react';
 import { Button } from '../components/Button';
 import { STEPS } from '../constants';
@@ -171,9 +171,108 @@ export const QuotationFlow: React.FC = () => {
 
   const deleteProjectItem = (itemId: string) => {
       if (!project) return;
-      // Removed window.confirm to allow immediate deletion as requested
+      // Remove from both items and pricing to ensure sync
       const newItems = project.items.filter(item => item.id !== itemId);
-      updateProject({ items: newItems });
+      let newPricing = project.pricing;
+      if (project.pricing) {
+          newPricing = project.pricing.filter(item => item.id !== itemId);
+      }
+      updateProject({ items: newItems, pricing: newPricing });
+  };
+
+  const addBOMItem = () => {
+      if (!project) return;
+      
+      const newItem: PricingLineItem = {
+          id: crypto.randomUUID(),
+          originalCode: 'NEW',
+          normalizedCode: 'NEW',
+          description: 'Manual Entry',
+          quantity: 1,
+          width: 0, height: 0, depth: 0,
+          type: 'Base',
+          
+          // Pricing fields
+          basePrice: 0,
+          optionsPrice: 0,
+          tierMultiplier: 1,
+          finalUnitPrice: 0,
+          totalPrice: 0,
+          tierName: project.selectedTierId || 'Default',
+          source: 'Manual Entry',
+          appliedOptions: []
+      };
+
+      const newItems = [...project.items, newItem];
+      const newPricing = project.pricing ? [...project.pricing, newItem] : [newItem];
+      
+      updateProject({ items: newItems, pricing: newPricing });
+  };
+
+  const handleBOMUpdate = async (itemId: string, field: 'code' | 'quantity' | 'price', value: string | number) => {
+      if (!project || !project.pricing) return;
+      
+      const newPricing = [...project.pricing];
+      const index = newPricing.findIndex(i => i.id === itemId);
+      if (index === -1) return;
+      
+      let item = { ...newPricing[index] };
+      let shouldReprice = false;
+
+      if (field === 'code') {
+          const newCode = (value as string).toUpperCase();
+          if (item.originalCode === newCode) return; 
+          item.originalCode = newCode;
+          item.normalizedCode = normalizeNKBACode(newCode);
+          shouldReprice = true;
+      } else if (field === 'quantity') {
+          const newQty = value as number;
+          if (item.quantity === newQty) return;
+          item.quantity = newQty;
+          item.totalPrice = item.finalUnitPrice * item.quantity;
+      } else if (field === 'price') {
+          const newPrice = value as number;
+          if (item.finalUnitPrice === newPrice) return;
+          item.finalUnitPrice = newPrice;
+          item.source = "Manual Override";
+          item.totalPrice = item.finalUnitPrice * item.quantity;
+      }
+
+      if (shouldReprice) {
+           const mfgId = project.manufacturerId;
+           if (mfgId) {
+               const mfg = manufacturers.find(m => m.id === mfgId);
+               if (mfg) {
+                   if (!mfg.catalog || Object.keys(mfg.catalog).length === 0) {
+                       setIsLoading(true);
+                       setLoadingMessage("Accessing Price Book...");
+                       mfg.catalog = await storage.getManufacturerCatalog(mfgId);
+                       setIsLoading(false);
+                       setLoadingMessage("");
+                   }
+                   
+                   const rePricedItems = calculateProjectPricing([item], mfg, project.selectedTierId || 'default', project.specs);
+                   if (rePricedItems.length > 0) {
+                       const newItem = rePricedItems[0];
+                       item.basePrice = newItem.basePrice;
+                       item.tierMultiplier = newItem.tierMultiplier;
+                       item.finalUnitPrice = newItem.finalUnitPrice;
+                       item.totalPrice = newItem.totalPrice;
+                       item.source = newItem.source;
+                       item.tierName = newItem.tierName;
+                   } else {
+                       item.finalUnitPrice = 0;
+                       item.totalPrice = 0;
+                       item.source = "Not Found in Catalog";
+                   }
+               }
+           }
+      }
+
+      newPricing[index] = item;
+      const updatedProject = { ...project, pricing: newPricing };
+      setProject(updatedProject);
+      await storage.saveActiveProject(updatedProject);
   };
 
   const handleBack = () => {
@@ -944,20 +1043,62 @@ export const QuotationFlow: React.FC = () => {
                 <div className="flex flex-col lg:flex-row gap-6">
                     <div className="flex-1 overflow-x-auto border border-slate-200 rounded-lg shadow-sm">
                         <table className="min-w-full divide-y divide-slate-200">
-                            <thead className="bg-slate-800 text-white"><tr><th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider">#</th><th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider">Cab Code</th><th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider">Description / Dims</th><th className="px-4 py-3 text-center text-xs font-bold uppercase tracking-wider">Qty</th><th className="px-4 py-3 text-right text-xs font-bold uppercase tracking-wider">Unit Price</th><th className="px-4 py-3 text-right text-xs font-bold uppercase tracking-wider">Total</th></tr></thead>
+                            <thead className="bg-slate-800 text-white"><tr><th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider">#</th><th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider">Cab Code</th><th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider">Description / Dims</th><th className="px-4 py-3 text-center text-xs font-bold uppercase tracking-wider">Qty</th><th className="px-4 py-3 text-right text-xs font-bold uppercase tracking-wider">Unit Price</th><th className="px-4 py-3 text-right text-xs font-bold uppercase tracking-wider">Total</th><th className="px-4 py-3 w-10"></th></tr></thead>
                             <tbody className="bg-white divide-y divide-slate-100">
                                 {project.pricing.map((item, index) => (
                                     <tr key={item.id} className={`hover:bg-slate-50 ${item.totalPrice === 0 ? 'bg-red-50/30' : ''}`}>
                                         <td className="px-4 py-3 text-slate-400 text-sm">{index + 1}</td>
-                                        <td className="px-4 py-3 font-mono font-bold text-slate-800 text-sm">{item.normalizedCode}{item.originalCode !== item.normalizedCode && (<div className="text-xs text-slate-400 font-normal">ref: {item.originalCode}</div>)}<div className="text-[10px] text-slate-400 mt-1">{item.source}</div></td>
+                                        <td className="px-4 py-3 font-mono font-bold text-slate-800 text-sm">
+                                            <DebouncedInput 
+                                                className="w-full bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5 font-bold text-slate-800" 
+                                                value={item.originalCode} 
+                                                onChange={(val: string) => handleBOMUpdate(item.id, 'code', val)}
+                                            />
+                                            {item.originalCode !== item.normalizedCode && (<div className="text-xs text-slate-400 font-normal mt-0.5">Norm: {item.normalizedCode}</div>)}
+                                            <div className="text-[10px] text-slate-400 mt-1 truncate max-w-[150px]" title={item.source}>{item.source}</div>
+                                        </td>
                                         <td className="px-4 py-3 text-sm text-slate-700"><div className="font-medium">{item.description}</div><div className="text-xs text-slate-500 mt-0.5">{item.width}"W x {item.height}"H x {item.depth}"D</div>{item.appliedOptions && item.appliedOptions.length > 0 && (<div className="mt-1 flex flex-wrap gap-1">{item.appliedOptions.map((opt, i) => (<span key={i} className="text-[10px] bg-green-50 text-green-700 px-1.5 py-0.5 rounded border border-green-100">+{opt.name} (${opt.price})</span>))}</div>)}</td>
-                                        <td className="px-4 py-3 text-center text-sm font-medium">{item.quantity}</td>
-                                        <td className="px-4 py-3 text-right text-sm">{item.finalUnitPrice === 0 ? (<span className="flex items-center justify-end gap-1 text-red-600 font-bold bg-red-50 px-2 py-0.5 rounded"><AlertCircle className="w-3 h-3"/> CHECK PRICE</span>) : (<span className="text-slate-600">${item.finalUnitPrice.toLocaleString()}</span>)}</td>
+                                        <td className="px-4 py-3 text-center text-sm font-medium">
+                                            <DebouncedInput 
+                                                type="number" 
+                                                className="w-16 text-center bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5" 
+                                                value={item.quantity} 
+                                                onChange={(val: number) => handleBOMUpdate(item.id, 'quantity', val)}
+                                            />
+                                        </td>
+                                        <td className="px-4 py-3 text-right text-sm">
+                                            <div className="flex items-center justify-end gap-1">
+                                                <span className="text-slate-400 text-xs">$</span>
+                                                <DebouncedInput 
+                                                    type="number" 
+                                                    className={`w-20 text-right bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5 ${item.finalUnitPrice === 0 ? 'text-red-600 font-bold' : 'text-slate-600'}`}
+                                                    value={item.finalUnitPrice} 
+                                                    onChange={(val: number) => handleBOMUpdate(item.id, 'price', val)}
+                                                />
+                                            </div>
+                                            {item.finalUnitPrice === 0 && (
+                                                <div className="text-[10px] text-red-500 mt-1 text-right font-bold flex items-center justify-end gap-1"><AlertCircle className="w-3 h-3"/> CHECK PRICE</div>
+                                            )}
+                                        </td>
                                         <td className="px-4 py-3 text-right text-sm font-bold">{item.totalPrice === 0 ? (<span className="text-red-600">$0.00</span>) : (<span className="text-slate-900">${item.totalPrice.toLocaleString()}</span>)}</td>
+                                        <td className="px-4 py-3 text-center">
+                                            <button 
+                                                onClick={() => deleteProjectItem(item.id)}
+                                                className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors"
+                                                title="Delete Item"
+                                            >
+                                                <Trash2 className="w-4 h-4" />
+                                            </button>
+                                        </td>
                                     </tr>
                                 ))}
                             </tbody>
                         </table>
+                        <div className="p-3 bg-slate-50 border-t border-slate-200">
+                             <Button variant="ghost" onClick={addBOMItem} className="text-brand-600 hover:text-brand-700 hover:bg-brand-50 w-full flex justify-center items-center gap-2 border border-dashed border-brand-200">
+                                 <Plus className="w-4 h-4" /> Add Manual Item
+                             </Button>
+                        </div>
                     </div>
                     
                     <div className="w-full lg:w-80 shrink-0 space-y-4">
