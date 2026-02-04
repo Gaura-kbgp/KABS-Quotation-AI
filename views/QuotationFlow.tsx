@@ -661,6 +661,24 @@ export const QuotationFlow: React.FC = () => {
      updateProject({ specs: newSpecs });
   };
 
+  const updateDynamicSelection = (category: string, value: string) => {
+      if (!project) return;
+      const currentDyn = project.specs?.dynamicSelections || {};
+      const newDyn = { ...currentDyn, [category]: value };
+      
+      // Also sync with legacy top-level fields for backward compatibility if needed
+      const updates: Partial<ProjectSpecs> = { dynamicSelections: newDyn };
+      
+      if (category === 'Series') updates.seriesName = value;
+      if (category === 'DoorStyle') updates.wallDoorStyle = value;
+      if (category === 'Finish' || category === 'Paint' || category === 'Stain') updates.finishColor = value;
+      if (category === 'Hinge') updates.hingeType = value;
+      if (category === 'Drawer') updates.drawerBox = value;
+
+      const newSpecs = { ...project.specs, ...updates };
+      updateProject({ specs: newSpecs });
+  };
+
   const toggleOption = (optionId: string, checked: boolean) => {
       if (!project || !project.specs) return;
       const newSelected = { ...project.specs.selectedOptions, [optionId]: checked };
@@ -673,43 +691,30 @@ export const QuotationFlow: React.FC = () => {
   const groupedReviewItems = getGroupedItems(project.items);
 
   // Group options for display
-  const groupedOptions: Record<string, ManufacturerOption[]> = {
-      'Construction': [], 'Drawer': [], 'Hardware': [], 'Paint': [], 'Door': [], 'DoorStyle': [], 'Finish': [], 'PrintedEnd': [], 'Series': [], 'Wood': [], 'Other': [],
-      'Door Edge': [], 'Glaze': [], 'Highlight': [], 'Door Option': []
-  };
+  const groupedOptions: Record<string, ManufacturerOption[]> = {};
   
+  // Helper to ensure group exists
+  const ensureGroup = (key: string) => {
+      if (!groupedOptions[key]) groupedOptions[key] = [];
+  };
+
   if (currentMfg && currentMfg.options) {
       currentMfg.options.forEach(opt => {
-          let cat: string = opt.category;
-          if (cat === 'Hinge') cat = 'Hardware';
-          if (cat === 'Highlights') cat = 'Highlight';
-          if (cat === 'DoorOption') cat = 'Door Option';
-          if (cat === 'DoorEdge') cat = 'Door Edge';
-
-          if (!groupedOptions[cat]) cat = 'Other';
+          let cat: string = opt.category || 'Other';
+          // Normalize only critical UI groupings, otherwise keep raw
+          if (cat === 'Hinge') cat = 'Hardware'; 
+          
+          ensureGroup(cat);
           groupedOptions[cat].push(opt);
-
-          // Heuristic: Also populate 'Wood' if name contains common species
-          // This allows "Material" dropdown to be dynamic even if category isn't explicitly 'Wood'
-          if (['Maple', 'Oak', 'Cherry', 'Alder', 'Walnut', 'Hickory', 'Birch', 'Poplar', 'MDF', 'Paint Grade', 'Rustic'].some(w => opt.name.includes(w))) {
-              if (!groupedOptions['Wood'].find(x => x.name === opt.name)) {
-                  groupedOptions['Wood'].push(opt);
-              }
-          }
       });
   }
   if (currentMfg?.series?.length > 0) {
+      ensureGroup('Series');
       currentMfg.series.forEach(s => {
           if (!groupedOptions['Series'].find(d => d.name === s.name)) {
               groupedOptions['Series'].push({
                   id: `series_${s.id}`, name: s.name, category: 'Series', section: 'B-Series', pricingType: 'included', price: 0
               });
-          }
-          // Also keep backward compatibility for DoorStyle lookup if needed, but primarily Series
-          if (!groupedOptions['DoorStyle'].find(d => d.name === s.name)) {
-             groupedOptions['DoorStyle'].push({
-                 id: `series_${s.id}_ds`, name: s.name, category: 'DoorStyle', section: 'B-Series', pricingType: 'included', price: 0
-             });
           }
       });
   }
@@ -718,6 +723,7 @@ export const QuotationFlow: React.FC = () => {
           if (t.name.includes(' - ')) {
               const possibleStyle = t.name.split(' - ')[0];
               if (!['Standard', 'Premium', 'Level', 'Group', 'Tier'].some(w => possibleStyle.includes(w))) {
+                   ensureGroup('DoorStyle');
                    if (!groupedOptions['DoorStyle'].find(d => d.name === possibleStyle)) {
                         groupedOptions['DoorStyle'].push({
                             id: `tier_derived_${possibleStyle}`, name: possibleStyle, category: 'DoorStyle', section: 'Unknown', pricingType: 'included', price: 0
@@ -725,10 +731,11 @@ export const QuotationFlow: React.FC = () => {
                    }
               }
           }
-          // Also try to extract Wood Species from Tier Names (e.g. "Oak Standard")
+          // Extract Wood Species from Tier Names
           const commonWoods = ['Maple', 'Oak', 'Cherry', 'Alder', 'Walnut', 'Hickory', 'Birch', 'Poplar', 'MDF'];
           commonWoods.forEach(wood => {
               if (t.name.includes(wood)) {
+                  ensureGroup('Wood');
                   if (!groupedOptions['Wood'].find(w => w.name === wood)) {
                       groupedOptions['Wood'].push({
                           id: `tier_wood_${wood}`, name: wood, category: 'Other', section: 'Unknown', pricingType: 'included', price: 0
@@ -738,19 +745,28 @@ export const QuotationFlow: React.FC = () => {
           });
       });
   }
-  const availableFinishes = [...groupedOptions['Finish'], ...groupedOptions['PrintedEnd'], ...groupedOptions['Paint']].sort((a,b) => a.name.localeCompare(b.name));
-  const checklistOptions = [...groupedOptions['Construction'], ...groupedOptions['Drawer'], ...groupedOptions['Hardware'], ...groupedOptions['Finish'], ...groupedOptions['Paint'], ...groupedOptions['PrintedEnd'], ...groupedOptions['Door'], ...groupedOptions['Other']];
+
+  // Sort Categories Logic
+  const categoryOrder = [
+      'Series', 'DoorStyle', 'Door', 'Wood', 'Finish', 'Paint', 'Stain', 'Glaze', 
+      'Construction', 'Drawer', 'Hardware', 'Hinge', 'Door Option', 'Door Edge', 'Highlight', 'PrintedEnd',
+      'Toe Kick', 'Depth', 'Size'
+  ];
   
-  // Dynamic Options Lists
-  const seriesOptions = groupedOptions['Series'].length > 0 ? groupedOptions['Series'].map(o => o.name) : ["Midland", "Heartland", "Classic", "All"];
-  const drawerOptions = groupedOptions['Drawer'].length > 0 ? groupedOptions['Drawer'].map(o => o.name) : ["Standard Epoxy", "Dovetail Plywood", "Metal Box", "BLUMSC-7/8"];
-  const hingeOptions = groupedOptions['Hardware'].length > 0 ? groupedOptions['Hardware'].map(o => o.name) : ["Standard", "Soft Close", "Full", "Exposed"];
-  const woodOptions = groupedOptions['Wood'].length > 0 ? groupedOptions['Wood'].map(o => o.name) : ["Maple", "Oak", "Cherry", "Paint Grade-HD", "HDF"];
-  
-  const doorOptionOptions = groupedOptions['Door Option'].length > 0 ? groupedOptions['Door Option'].map(o => o.name) : [];
-  const doorEdgeOptions = groupedOptions['Door Edge'].length > 0 ? groupedOptions['Door Edge'].map(o => o.name) : [];
-  const glazeOptions = groupedOptions['Glaze'].length > 0 ? groupedOptions['Glaze'].map(o => o.name) : [];
-  const highlightOptions = groupedOptions['Highlight'].length > 0 ? groupedOptions['Highlight'].map(o => o.name) : [];
+  const sortedCategories = Object.keys(groupedOptions).sort((a, b) => {
+      const idxA = categoryOrder.indexOf(a);
+      const idxB = categoryOrder.indexOf(b);
+      if (idxA !== -1 && idxB !== -1) return idxA - idxB;
+      if (idxA !== -1) return -1;
+      if (idxB !== -1) return 1;
+      return a.localeCompare(b);
+  });
+
+  // Dynamic Checklist Options (Upgrades or Priced items)
+  const checklistOptions = Object.values(groupedOptions).flat().filter(o => 
+      (o.category === 'Upgrade' || (o.price > 0 && o.pricingType !== 'included')) && 
+      !['Series', 'DoorStyle'].includes(o.category) // Exclude main selectors
+  );
   
   return (
     <div className="pb-20">
@@ -845,29 +861,68 @@ export const QuotationFlow: React.FC = () => {
                      <div className="flex items-start gap-3"><Button variant="ghost" size="sm" onClick={handleBack} className="mt-1 shrink-0"><ArrowLeft className="w-5 h-5" /></Button><div><h2 className="text-2xl font-bold text-slate-900">Kitchen Specifications</h2><p className="text-slate-500">Configure specifications exactly as per job requirements.</p></div></div>
                      <Button size="lg" onClick={handleSpecsConfirmed} className="gap-2 w-full sm:w-auto">Calculate Final Quote <ArrowRight className="w-4 h-4"/></Button>
                 </div>
+                {/* --- EXTERIOR DESIGN SECTION --- */}
                 <div className="border border-slate-300 rounded-lg overflow-hidden shadow-sm">
-                    <div className="bg-slate-100 px-6 py-3 border-b border-slate-300"><h3 className="font-bold text-slate-800 flex items-center gap-2"><Grid3X3 className="w-4 h-4"/> Kitchen: {project.name || 'Area Name'}</h3></div>
+                    <div className="bg-slate-100 px-6 py-3 border-b border-slate-300"><h3 className="font-bold text-slate-800 flex items-center gap-2"><PaintBucket className="w-4 h-4"/> Exterior Design</h3></div>
                     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-x-8 gap-y-6 p-6 bg-white">
-                        <SpecField label="Cabinet Line" type="select" options={seriesOptions} value={project.specs?.lineType} onChange={(v: string) => updateSpec('lineType', v)} />
-                        <SpecField label="Cardboard Boxed Cabinets" type="select" options={["Yes", "No"]} value={project.specs?.cardboardBoxed} onChange={(v: string) => updateSpec('cardboardBoxed', v)} />
-                        <div className="flex flex-col"><label className="text-[10px] uppercase font-bold text-slate-500 mb-1">Wall / Base Door Style</label><div className="flex gap-2"><select className="w-1/2 p-2 border border-slate-300 rounded text-sm bg-white" value={project.specs?.wallDoorStyle || ''} onChange={(e) => updateSpec('wallDoorStyle', e.target.value)}><option value="">Select Style...</option>{groupedOptions['DoorStyle'].filter(opt => !/^\d+$/.test(opt.name.trim()) && opt.name.trim().length > 1).sort((a,b) => a.name.localeCompare(b.name)).map(opt => <option key={opt.id} value={opt.name}>{opt.name}</option>)}</select><DebouncedInput className="w-1/2 p-2 border border-slate-300 rounded text-sm" placeholder="Base Style" value={project.specs?.baseDoorStyle || project.specs?.wallDoorStyle || ''} onChange={(val: string) => updateSpec('baseDoorStyle', val)} /></div></div>
-                        <SpecField label="Wall Door Option" type={doorOptionOptions.length > 0 ? "select" : "text"} options={doorOptionOptions} value={project.specs?.wallDoorOption} onChange={(v: string) => updateSpec('wallDoorOption', v)} />
-                        <SpecField label="Base Door Option" type={doorOptionOptions.length > 0 ? "select" : "text"} options={doorOptionOptions} value={project.specs?.baseDoorOption} onChange={(v: string) => updateSpec('baseDoorOption', v)} />
-                        <SpecField label="Door Edge" type={doorEdgeOptions.length > 0 ? "select" : "text"} options={doorEdgeOptions} value={project.specs?.doorEdge} onChange={(v: string) => updateSpec('doorEdge', v)} />
-                        <SpecField label="Drawer Box" type="select" options={drawerOptions} value={project.specs?.drawerBox} onChange={(v: string) => updateSpec('drawerBox', v)} />
-                        <SpecField label="Drawer Front" value={project.specs?.drawerFront} onChange={(v: string) => updateSpec('drawerFront', v)} />
-                        <SpecField label="Hinge" type="select" options={hingeOptions} value={project.specs?.hingeType} onChange={(v: string) => updateSpec('hingeType', v)} />
-                        <SpecField label="Soft Close Hinges" type="select" options={["Yes", "No"]} value={project.specs?.softCloseHinges} onChange={(v: string) => updateSpec('softCloseHinges', v)} />
-                        <SpecField label="Wood" type="select" options={woodOptions} value={project.specs?.woodSpecies} onChange={(v: string) => updateSpec('woodSpecies', v)} />
-                        <div className="flex flex-col"><label className="text-[10px] uppercase font-bold text-slate-500 mb-1">Cabinet Finish / Color</label><select className="w-full p-2 border border-slate-300 rounded text-sm bg-white" value={project.specs?.finishColor || ''} onChange={(e) => updateSpec('finishColor', e.target.value)}><option value="">Select Finish...</option>{availableFinishes.some(o => o.name.startsWith('Stain:')) && (<optgroup label="Stain">{availableFinishes.filter(o => o.name.startsWith('Stain:')).map(opt => <option key={opt.id} value={opt.name.replace('Stain: ', '')}>{opt.name.replace('Stain: ', '')}</option>)}</optgroup>)}{availableFinishes.some(o => o.name.startsWith('Paint:')) && (<optgroup label="Paint">{availableFinishes.filter(o => o.name.startsWith('Paint:')).map(opt => <option key={opt.id} value={opt.name.replace('Paint: ', '')}>{opt.name.replace('Paint: ', '')}</option>)}</optgroup>)}{availableFinishes.some(o => !o.name.startsWith('Paint:') && !o.name.startsWith('Stain:')) && (<optgroup label="Other Options">{availableFinishes.filter(o => !o.name.startsWith('Paint:') && !o.name.startsWith('Stain:')).map(opt => <option key={opt.id} value={opt.name}>{opt.name}</option>)}</optgroup>)}</select></div>
-                        <SpecField label="Glaze" type={glazeOptions.length > 0 ? "select" : "text"} options={glazeOptions} value={project.specs?.glaze} onChange={(v: string) => updateSpec('glaze', v)} />
-                        <SpecField label="Finish Option 1" value={project.specs?.finishOption1} onChange={(v: string) => updateSpec('finishOption1', v)} />
-                        <SpecField label="Finish Option 2" value={project.specs?.finishOption2} onChange={(v: string) => updateSpec('finishOption2', v)} />
-                        <div className="flex flex-col"><label className="text-[10px] uppercase font-bold text-slate-500 mb-1">Printed Ends</label><select className="w-full p-2 border border-slate-300 rounded text-sm bg-white" value={project.specs?.printedEndOption || 'No'} onChange={(e) => updateSpec('printedEndOption', e.target.value)}><option value="No">No</option><option value="Matching">Matching</option>{availableFinishes.some(o => o.name.startsWith('Stain:')) && (<optgroup label="Stain">{availableFinishes.filter(o => o.name.startsWith('Stain:')).map(opt => <option key={opt.id} value={opt.name.replace('Stain: ', '')}>{opt.name.replace('Stain: ', '')}</option>)}</optgroup>)}{availableFinishes.some(o => o.name.startsWith('Paint:')) && (<optgroup label="Paint">{availableFinishes.filter(o => o.name.startsWith('Paint:')).map(opt => <option key={opt.id} value={opt.name.replace('Paint: ', '')}>{opt.name.replace('Paint: ', '')}</option>)}</optgroup>)}</select></div>
-                        <SpecField label="Highlights" type={highlightOptions.length > 0 ? "select" : "text"} options={highlightOptions} value={project.specs?.highlights} onChange={(v: string) => updateSpec('highlights', v)} />
+                        {['Series', 'DoorStyle', 'Wood', 'Finish', 'Glaze'].map(cat => {
+                             const options = groupedOptions[cat] || [];
+                             // Fallback: If no options are available, switch to Text Input
+                             // This prevents "Select..." dead ends and allows manual entry
+                             const isSelect = options.length > 0;
+                             
+                             return (
+                                <SpecField 
+                                    key={cat}
+                                    label={cat === 'Wood' ? 'Wood Species' : cat} 
+                                    type={isSelect ? "select" : "text"} 
+                                    options={isSelect ? Array.from(new Set(options.map(o => o.name))).map((name, i) => {
+                                        const opt = options.find(o => o.name === name);
+                                        let label = name;
+                                        if (opt && opt.pricingType !== 'included' && opt.price > 0) {
+                                            label += ` (${opt.pricingType === 'percentage' ? '+' + (opt.price * 100).toFixed(0) + '%' : '+$' + opt.price})`;
+                                        }
+                                        return { id: `${cat}_opt_${i}`, label, value: name };
+                                    }) : []}
+                                    value={project.specs?.dynamicSelections?.[cat] || ''} 
+                                    onChange={(v: string) => updateDynamicSelection(cat, v)} 
+                                />
+                             );
+                        })}
                     </div>
                 </div>
-                {checklistOptions.length > 0 && (<div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm mt-6"><h4 className="font-bold text-slate-800 mb-4 flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-brand-600"/> Additional Upgrades & Options</h4><div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">{checklistOptions.map(opt => (<label key={opt.id} className="flex items-start gap-3 p-3 hover:bg-slate-50 rounded cursor-pointer border border-slate-100 hover:border-brand-200 transition-all"><input type="checkbox" className="mt-1 w-4 h-4 text-brand-600 rounded border-gray-300 focus:ring-brand-500" checked={!!project.specs?.selectedOptions?.[opt.id]} onChange={(e) => toggleOption(opt.id, e.target.checked)}/><div className="text-sm"><div className="font-medium text-slate-900">{opt.name}</div><div className="text-slate-500 text-xs flex justify-between gap-4 mt-1"><span>{opt.category}</span><span className="font-mono text-brand-700 font-bold">{opt.pricingType === 'percentage' ? `+${(opt.price*100).toFixed(0)}%` : `+$${opt.price}`}</span></div></div></label>))}</div></div>)}
+
+                {/* --- CONSTRUCTION & HARDWARE SECTION --- */}
+                <div className="border border-slate-300 rounded-lg overflow-hidden shadow-sm">
+                    <div className="bg-slate-100 px-6 py-3 border-b border-slate-300"><h3 className="font-bold text-slate-800 flex items-center gap-2"><Hammer className="w-4 h-4"/> Construction & Hardware</h3></div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-x-8 gap-y-6 p-6 bg-white">
+                        {['Construction', 'Drawer', 'Hinge', 'PrintedEnd'].map(cat => {
+                             const options = groupedOptions[cat] || [];
+                             if (options.length === 0 && cat !== 'Construction' && cat !== 'Drawer' && cat !== 'Hinge') return null; // Hide non-core if empty
+
+                             const isSelect = options.length > 0;
+                             
+                             return (
+                                <SpecField 
+                                    key={cat}
+                                    label={cat === 'PrintedEnd' ? 'Printed Ends' : cat} 
+                                    type={isSelect ? "select" : "text"} 
+                                    options={isSelect ? Array.from(new Set(options.map(o => o.name))).map((name, i) => {
+                                        const opt = options.find(o => o.name === name);
+                                        let label = name;
+                                        if (opt && opt.pricingType !== 'included' && opt.price > 0) {
+                                            label += ` (${opt.pricingType === 'percentage' ? '+' + (opt.price * 100).toFixed(0) + '%' : '+$' + opt.price})`;
+                                        }
+                                        return { id: `${cat}_opt_${i}`, label, value: name };
+                                    }) : []}
+                                    value={project.specs?.dynamicSelections?.[cat] || ''} 
+                                    onChange={(v: string) => updateDynamicSelection(cat, v)} 
+                                />
+                             );
+                        })}
+                    </div>
+                </div>
+                {checklistOptions.length > 0 && (<div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm mt-6"><h4 className="font-bold text-slate-800 mb-4 flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-brand-600"/> Additional Upgrades & Options</h4><div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">{checklistOptions.map((opt, idx) => (<label key={opt.id || `check_${idx}`} className="flex items-start gap-3 p-3 hover:bg-slate-50 rounded cursor-pointer border border-slate-100 hover:border-brand-200 transition-all"><input type="checkbox" className="mt-1 w-4 h-4 text-brand-600 rounded border-gray-300 focus:ring-brand-500" checked={!!project.specs?.selectedOptions?.[opt.id]} onChange={(e) => toggleOption(opt.id, e.target.checked)}/><div className="text-sm"><div className="font-medium text-slate-900">{opt.name}</div><div className="text-slate-500 text-xs flex justify-between gap-4 mt-1"><span>{opt.category}</span><span className="font-mono text-brand-700 font-bold">{opt.pricingType === 'percentage' ? `+${(opt.price*100).toFixed(0)}%` : `+$${opt.price}`}</span></div></div></label>))}</div></div>)}
              </div>
         )}
         

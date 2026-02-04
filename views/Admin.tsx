@@ -4,10 +4,9 @@ import { Trash2, Plus, Upload, FileSpreadsheet, FileText, AlertTriangle, CheckCi
 import { Button } from '../components/Button';
 import { Manufacturer, ManufacturerFile, NKBARules, PricingTier, ManufacturerOption, CabinetSeries, WorkbookSection } from '../types';
 import { storage } from '../services/storage';
-import { determineExcelStructure } from '../services/ai';
+import { determineExcelStructure, extractManufacturerSpecs } from '../services/ai';
 import { normalizeNKBACode } from '../services/pricingEngine';
-import * as XLSX from 'xlsx';
-import JSZip from 'jszip';
+import type JSZip from 'jszip';
 
 // --- HELPERS ---
 
@@ -313,6 +312,10 @@ export const Admin: React.FC = () => {
   };
 
   const handleMfgFileUpload = async (type: 'pricing' | 'spec', e: React.ChangeEvent<HTMLInputElement>) => {
+    // Dynamic Import for heavy libraries
+    const XLSX = await import('xlsx');
+    const JSZip = (await import('jszip')).default;
+
     if (!managingMfg || !e.target.files || e.target.files.length === 0) return;
     const files = Array.from(e.target.files);
     
@@ -347,8 +350,84 @@ export const Admin: React.FC = () => {
               try {
                   const url = await storage.uploadSpecBook(managingMfg.id, file);
                   newFile.url = url;
+
+                  // AI EXTRACTION OF SPECS
+                  setUploadStatus(`AI Analyzing Spec Book ${file.name} (This may take a minute)...`);
+                  await new Promise(resolve => setTimeout(resolve, 50)); // Yield to UI
+                  
+                  const extractedSpecs = await extractManufacturerSpecs(file);
+                  
+                  let flatOptions: any[] = [];
+                  if (extractedSpecs && Array.isArray(extractedSpecs.specificationSections)) {
+                      // NEW FORMAT: Flatten the structured specs into simple options for now
+                      extractedSpecs.specificationSections.forEach((sec: any) => {
+                          // Map Section Name to Category
+                          let cat = sec.section;
+                          if (cat.toLowerCase().includes('door')) cat = 'DoorStyle';
+                          else if (cat.toLowerCase().includes('finish') || cat.toLowerCase().includes('paint')) cat = 'Finish';
+                          else if (cat.toLowerCase().includes('construction')) cat = 'Construction';
+                          else if (cat.toLowerCase().includes('drawer')) cat = 'Drawer';
+                          else if (cat.toLowerCase().includes('hinge')) cat = 'Hinge';
+
+                          if (Array.isArray(sec.options)) {
+                              sec.options.forEach((opt: any) => {
+                                  if (typeof opt === 'string') {
+                                      flatOptions.push({ name: opt, category: cat });
+                                  } else if (typeof opt === 'object') {
+                                      if (opt.name) {
+                                          flatOptions.push({ 
+                                              name: opt.name, 
+                                              category: cat, 
+                                              description: opt.series ? `${opt.series} Series` : opt.description 
+                                          });
+                                      }
+                                      
+                                      // Handle Dependent Finishes (e.g. inside a Door Style option)
+                                      if (opt.finishes) {
+                                          Object.keys(opt.finishes).forEach(finishType => {
+                                              const finishes = opt.finishes[finishType];
+                                              if (Array.isArray(finishes)) {
+                                                  finishes.forEach(f => {
+                                                      flatOptions.push({ name: f, category: 'Finish', description: `${finishType} (for ${opt.name || 'Door'})` });
+                                                  });
+                                              }
+                                          });
+                                      }
+                                  }
+                              });
+                          }
+                      });
+                      
+                      console.log(`AI found ${flatOptions.length} flattened spec options from new structure`);
+                  } else if (Array.isArray(extractedSpecs)) {
+                      // OLD FORMAT FALLBACK
+                      flatOptions = extractedSpecs;
+                  }
+
+                  if (flatOptions.length > 0) {
+                      const newOptions: ManufacturerOption[] = flatOptions.map((spec, idx) => ({
+                          id: `spec_ai_${Date.now()}_${idx}`,
+                          name: spec.name,
+                          category: spec.category as any, 
+                          section: 'A-Context', 
+                          pricingType: 'included',
+                          price: 0,
+                          description: spec.description,
+                          sourceSheet: file.name
+                      }));
+                      
+                      // Merge new options, avoiding exact duplicates
+                      newOptions.forEach(opt => {
+                          const exists = updatedOptions.find(o => o.name === opt.name && o.category === opt.category);
+                          if (!exists) {
+                              updatedOptions.push(opt);
+                          }
+                      });
+                  }
+
               } catch (e) {
-                  console.error(`Failed to upload spec ${file.name}`, e);
+                  console.error(`Failed to upload/process spec ${file.name}`, e);
+                  alert(`Spec upload failed or AI could not read file: ${e.message}`);
               }
           }
 
@@ -394,20 +473,54 @@ export const Admin: React.FC = () => {
                     
                     // Use Heuristics FIRST to save time
                     const headerRowIdx = rows.findIndex(r => r.some((c:any) => 
-                        String(c).match(/sku|item|product|code|model|part|cabinet|number|no\.|key/i)
+                        String(c).match(/sku|item|product|code|model|part|cabinet|number|no\.|key|nomenclature|style/i)
                     ));
                     
                     if (headerRowIdx !== -1) {
                          const headerRow = rows[headerRowIdx].map(String);
-                         structure.skuColumn = headerRow.findIndex(c => c.match(/sku|item|product|code|model|part|cabinet|number|no\.|key/i));
+                         structure.skuColumn = headerRow.findIndex(c => c.match(/sku|item|product|code|model|part|cabinet|number|no\.|key|nomenclature|style/i));
                          
                          // Find price columns
                          headerRow.forEach((h, idx) => {
                              // Enhanced Price Detection
-                             if ((h.match(/price|cost|list|msrp|amount|rate|net/i) || h.includes('$')) && !h.match(/code|sku|model|part|page/i)) {
+                             if ((h.match(/price|cost|list|msrp|amount|rate|net|retail|unit/i) || h.includes('$')) && !h.match(/code|sku|model|part|page|width|height|depth/i)) {
                                  structure.priceColumns.push({ index: idx, name: h });
                              }
                          });
+                    }
+
+                    // Fallback: If no header row found but we have data, try Column 0 as SKU if it looks valid
+                    if (structure.skuColumn === null && rows.length > 5) {
+                        // Check if Column 0 has SKU-like data (short alphanumeric strings)
+                        const col0Samples = rows.slice(1, 10).map(r => String(r[0] || ""));
+                        const isSkuLike = col0Samples.every(s => s.length > 2 && s.length < 20 && /[A-Z0-9]/.test(s));
+                        
+                        if (isSkuLike) {
+                            structure.skuColumn = 0;
+                            console.log(`Fallback: Assuming Column A is SKU for sheet ${sheetName}`);
+                            
+                            // Look for first price-like column
+                            // Check first 10 rows for a column that has $ or is numeric
+                            const potentialPriceCols: number[] = [];
+                            // Check columns 1 to 10
+                            for (let c = 1; c < Math.min(rows[0].length, 10); c++) {
+                                 const colSamples = rows.slice(1, 10).map(r => r[c]);
+                                 const isNumeric = colSamples.every(v => {
+                                     if (!v) return true; // Ignore empty
+                                     const s = String(v).replace(/[$,]/g, '');
+                                     return !isNaN(parseFloat(s));
+                                 });
+                                 if (isNumeric) potentialPriceCols.push(c);
+                            }
+                            
+                            if (potentialPriceCols.length > 0) {
+                                // Take the last one (often List Price is last) or first one? 
+                                // Usually List Price is early. Let's take all.
+                                potentialPriceCols.forEach(idx => {
+                                    structure.priceColumns.push({ index: idx, name: `Column ${String.fromCharCode(65+idx)}` });
+                                });
+                            }
+                        }
                     }
 
                     // Fallback to AI if heuristics fail

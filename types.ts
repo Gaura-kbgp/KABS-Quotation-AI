@@ -48,7 +48,7 @@ export type WorkbookSection =
 export interface ManufacturerOption {
   id: string;
   name: string;
-  category: 'Series' | 'Door' | 'DoorStyle' | 'Finish' | 'Drawer' | 'Hinge' | 'Construction' | 'PrintedEnd' | 'Other';
+  category: 'Series' | 'Door' | 'DoorStyle' | 'Finish' | 'Drawer' | 'Hinge' | 'Construction' | 'PrintedEnd' | 'Upgrade' | 'Other';
   section: WorkbookSection; // Audit trail for where this option was found
   pricingType: 'fixed' | 'percentage' | 'included';
   price: number; // Dollar amount or Decimal percentage (0.10 for 10%)
@@ -141,6 +141,10 @@ export interface ProjectSpecs {
   // CONSTRUCTION & UPGRADES (Checkboxes for extra line items)
   selectedOptions?: Record<string, boolean>; 
   
+  // DYNAMIC SELECTIONS (For Dropdowns/Single-Select Categories)
+  // Maps Category Name -> Selected Option Name
+  dynamicSelections?: Record<string, string>;
+
   notes?: string;
 }
 

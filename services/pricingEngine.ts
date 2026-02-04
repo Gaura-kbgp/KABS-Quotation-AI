@@ -27,6 +27,9 @@ export const normalizeNKBACode = (rawCode: string): string => {
     code = code.replace(/-?2B$/, ''); 
     code = code.replace(/-?BUTT$/, '');
     
+    // NEW: Handle (L) or (R) in parenthesis
+    code = code.replace(/\([LR]\)$/, '');
+
     // NEW: Handle "DP" (Deep) or "BUT" (Butt) inside the code like W3618 X 24 DP BUT
     code = code.replace(/\s*X\s*\d+\s*DP/g, ''); // Remove explicit depth notation e.g. " X 24 DP"
     code = code.replace(/\s*BUTT?/g, ''); // Remove BUT or BUTT
@@ -34,7 +37,11 @@ export const normalizeNKBACode = (rawCode: string): string => {
     // NEW: Handle "1TD" (Tray Divider) or "ROT" (Roll Out Tray) embedded in code
     code = code.replace(/\d*TD/g, ''); // Remove "1TD", "TD"
     code = code.replace(/ROT/g, '');   // Remove "ROT"
-    code = code.replace(/\./g, '');    // Remove dots (MW.HOOD -> MWHOOD)
+    
+    // Fix: Only remove dots if NOT part of a decimal number (e.g. keep 1.5, remove MW.HOOD)
+    // We remove dot if it is NOT followed by a digit, OR if it is not preceded by a digit
+    // But simplest is: replace dot if it's not between two digits
+    code = code.replace(/(?<!\d)\./g, '').replace(/\.(?!\d)/g, '');    
 
     // --- NEW LOGIC: AGGRESSIVE SUFFIX STRIPPING ---
     // Handle "AH", "VH", "PH" often used for construction types
@@ -100,209 +107,142 @@ const isGarbageItem = (item: CabinetItem): boolean => {
 };
 
 // Helper to generate manufacturer-specific permutation keys based on NKBA standards
-const generateSmartKeys = (item: CabinetItem): string[] => {
-    const keys: string[] = [];
+const generateSmartKeys = (item: CabinetItem): { exact: string[], similar: string[] } => {
+    const exactKeys: string[] = [];
+    const similarKeys: string[] = [];
+    const processed = new Set<string>();
+
     const { width, height, depth, type, originalCode, normalizedCode } = item;
     
     const cleanCode = normalizeNKBACode(originalCode);
     const cleanNorm = normalizeNKBACode(normalizedCode || '');
 
     // Helper: Add key and its variations
-    // preventRecursion flag stops infinite loops of neighbor generation
-    const add = (k: string, generateNeighbors: boolean = true) => {
+    const add = (k: string, category: 'exact' | 'similar' = 'exact', allowNeighbors: boolean = true) => {
         if (!k) return;
         const upper = k.toUpperCase().replace(/\s+/g, ''); // Ensure no spaces
-        if (!keys.includes(upper)) keys.push(upper);
         
-        // Add hyphenated variations for common break points: [Letters][Numbers] -> [Letters]-[Numbers]
-        // e.g. B15 -> B-15 (rare but possible) or VDB24 -> VDB-24
+        // Prevent Duplicates
+        if (processed.has(upper)) return;
+        processed.add(upper);
+        
+        if (category === 'exact') exactKeys.push(upper);
+        else similarKeys.push(upper);
+        
+        // Add hyphenated variations: [Letters][Numbers] -> [Letters]-[Numbers]
         if (upper.match(/^[A-Z]+\d+$/)) {
             const split = upper.match(/^([A-Z]+)(\d+)$/);
             if (split) {
                 const hyphenated = `${split[1]}-${split[2]}`;
-                if (!keys.includes(hyphenated)) keys.push(hyphenated);
+                if (!processed.has(hyphenated)) {
+                    processed.add(hyphenated);
+                    if (category === 'exact') exactKeys.push(hyphenated);
+                    else similarKeys.push(hyphenated);
+                }
             }
         }
 
-        // Add variation stripping arbitrary suffixes like -W, -A, -B (often cosmetic or misread)
-        // e.g. VDB24-W -> VDB24
+        // Variation: Strip arbitrary suffixes like -W, -A, -B (High confidence normalization = Exact)
         if (upper.includes('-')) {
             const parts = upper.split('-');
             const base = parts[0];
-            const suffix = parts.slice(1).join('-'); // Rejoin rest in case of multiple dashes
+            const suffix = parts.slice(1).join('-'); 
             
             // If suffix is single letter, small number, or specific junk
             if (suffix.length <= 3 || suffix === 'BUTT' || suffix === '2B' || suffix.match(/^\d+$/)) {
-                add(base, true); // Allow neighbors for the base stripped version
+                // If we strip a cosmetic suffix, it's still considered an "Exact" intent match
+                add(base, category, allowNeighbors); 
             }
         }
 
-        // --- NEW: Handle "S" -> "SB" Mapping for Sink Bases ---
-        // S30-25 -> S30 -> SB30
-        if (upper.match(/^S\d+$/)) {
-            add(upper.replace('S', 'SB'), true); // S30 -> SB30
-        }
-
-        // --- NEW: Handle "WDH" -> "W" / "WDC" Mapping ---
-        // WDH24 -> WDC2430, W2430, etc.
-        if (upper.startsWith('WDH')) {
-             const nums = upper.match(/(\d+)/)?.[0];
-             if (nums) {
-                 // Try Wall Diagonal Corner
-                 add(`WDC${nums}30`, false);
-                 add(`WDC${nums}36`, false);
-                 add(`WDC${nums}42`, false);
-                 // Try Standard Wall
-                 add(`W${nums}30`, false);
-                 add(`W${nums}36`, false);
-                 add(`W${nums}42`, false);
-             }
-        }
-
-        // --- NEW: Handle "DHW" -> "DW" Mapping ---
-        if (upper.startsWith('DHW')) {
-            add(upper.replace('DHW', 'DW'), true);
-        }
-
-        // --- NEW: Handle "PDF" -> "PNL" / "F" Mapping ---
-        // PDF-05 -> PNL05, F05
-        if (upper.startsWith('PDF')) {
-             const nums = upper.match(/(\d+)/)?.[0];
-             if (nums) {
-                 add(`PNL${nums}`, false);
-                 add(`F${nums}`, false);
-                 add(`WF${nums}`, false); // Wall Filler
-                 add(`BF${nums}`, false); // Base Filler
-             }
-        }
-
-        // --- NEW: Handle "OUK" -> "ACC" / "KIT" Mapping ---
-        // OUK-030 -> ACC30, KIT30, or just try without prefix
-        if (upper.startsWith('OUK')) {
-             const nums = upper.match(/(\d+)/)?.[0];
-             if (nums) {
-                 add(`ACC${nums}`, false);
-                 add(`KIT${nums}`, false);
-             }
-        }
-        
-        // --- NEW: Handle "CE" -> "CM" (Crown Molding) Mapping ---
-        // CEHD -> CE -> CM
-        if (upper.startsWith('CE')) {
-            add(upper.replace('CE', 'CM'), false);
-            add(upper.replace('CE', 'M'), false);
-        }
-
-        // --- NEW: Nearest Width Neighbor (Smartbrain) ---
-        // Only run this if explicitly allowed (prevents infinite recursion)
-        if (generateNeighbors) {
+        // Neighbor Generation (Always classified as SIMILAR)
+        if (allowNeighbors) {
             // e.g. SB39 -> SB36, SB42
             const widthMatch = upper.match(/^([A-Z]+)(\d{2,3})$/);
             if (widthMatch) {
                 const [_, prefix, wStr] = widthMatch;
-                // Only apply to Bases/Vanities/Walls where width is the main number
                 if (['SB', 'DB', 'B', 'VSB', 'VDB', 'W', 'BBC', 'S', 'VB', 'V'].includes(prefix)) {
                     const w = parseInt(wStr);
-                    // Try +/- 3 inches (standard increments)
-                    add(`${prefix}${w - 3}`, false);
-                    add(`${prefix}${w + 3}`, false);
+                    // Try +/- 3 inches
+                    add(`${prefix}${w - 3}`, 'similar', false);
+                    add(`${prefix}${w + 3}`, 'similar', false);
                     // Try +/- 6 inches
-                    add(`${prefix}${w - 6}`, false);
-                    add(`${prefix}${w + 6}`, false);
+                    add(`${prefix}${w - 6}`, 'similar', false);
+                    add(`${prefix}${w + 6}`, 'similar', false);
     
-                    // --- NEW: Cross-Category Fallback ---
-                    // If SB39 (Sink Base) fails, try B39 (Base) or VSB39 (Vanity Sink Base)
-                    // Set generateNeighbors=false to prevent infinite loops (SB -> VSB -> SB)
+                    // Cross-Category Fallback
                     if (prefix === 'SB') {
-                        add(`B${w}`, false); 
-                        add(`VSB${w}`, false);
+                        add(`B${w}`, 'similar', false); 
+                        add(`VSB${w}`, 'similar', false);
                     }
                     if (prefix === 'VSB') {
-                        add(`SB${w}`, false);
-                        add(`VDB${w}`, false);
+                        add(`SB${w}`, 'similar', false);
+                        add(`VDB${w}`, 'similar', false);
                     }
                 }
             }
         }
     };
 
-    // --- STRATEGY 0: FIRST TOKEN FALLBACK ---
-    // e.g. "W3618 X 24 DP BUT" -> "W3618"
-    // If the original code has spaces, the first part is often the real SKU.
+    // --- STRATEGY 0: FIRST TOKEN FALLBACK (Exact) ---
     if (originalCode.includes(' ')) {
         const firstToken = originalCode.split(' ')[0].trim().toUpperCase();
-        if (firstToken.length > 2) add(firstToken);
+        if (firstToken.length > 2) add(firstToken, 'exact', true);
     }
 
-    // --- STRATEGY 1: EXPLICIT CLEAN CODES ---
-    add(originalCode);
-    add(cleanCode);
-    if (normalizedCode) add(normalizedCode);
-    add(cleanNorm);
+    // --- STRATEGY 1: EXPLICIT CLEAN CODES (Exact) ---
+    add(originalCode, 'exact', true);
+    add(cleanCode, 'exact', true);
+    if (normalizedCode) add(normalizedCode, 'exact', true);
+    add(cleanNorm, 'exact', true);
 
-    // --- STRATEGY 1.5: COMMON TYPO TRANSPOSITION (The VDB/VBD Fix) ---
-    // Excel sheet often has 'VBD' instead of 'VDB' or vice versa
-    if (cleanCode.includes('VDB')) add(cleanCode.replace('VDB', 'VBD'));
-    if (cleanCode.includes('VBD')) add(cleanCode.replace('VBD', 'VDB'));
+    // --- STRATEGY 1.5: COMMON TYPO TRANSPOSITION (Exact/Correction) ---
+    if (cleanCode.includes('VDB')) add(cleanCode.replace('VDB', 'VBD'), 'exact', true);
+    if (cleanCode.includes('VBD')) add(cleanCode.replace('VBD', 'VDB'), 'exact', true);
 
-    // --- STRATEGY 2: HANDLE COMPLEX COMBINATIONS (e.g. 3DB2136 -> 3DB21) ---
-    // Regex: Start with non-digits, then digits, then 2 digits at end (height)
+    // --- STRATEGY 2: HANDLE COMPLEX COMBINATIONS (Exact) ---
+    // 3DB2136 -> 3DB21 (If 36 is height)
     const complexMatch = cleanCode.match(/^([0-9A-Z]+)(\d{2})$/);
     if (complexMatch) {
         const [_, prefix, suffix] = complexMatch;
         const sVal = parseInt(suffix);
-        // If the suffix looks like a height (30-42) and likely redundant for base/vanity pricing
         if (sVal >= 30 && sVal <= 42) {
-             add(prefix); 
+             add(prefix, 'exact', true); 
         }
     }
 
-    // --- STRATEGY 3: HANDLE VANITY/WALL CONFUSION (WDH -> VDB/VSB) ---
-    // OCR often mistakes 'V' for 'W'. If it's WDH (Wall Diagonal), it might be VDB (Vanity Drawer Base)
-    // Also user reported: WDH24-W -> Sink.
+    // --- STRATEGY 3: HANDLE VANITY/WALL CONFUSION (Similar/Correction) ---
     if (cleanCode.startsWith('W') || cleanCode.startsWith('WD')) {
-        // Specific fixes for common misreads or non-standard "WDH" usage for vanity
         if (cleanCode.startsWith('WDH')) {
-            const remainder = cleanCode.replace('WDH', ''); // e.g. 24-W or 24
-            
-            // Try explicit Vanity mappings
-            add(`VDB${remainder}`); // Vanity Drawer Base
-            add(`VBD${remainder}`); // Typo check
-            add(`VSB${remainder}`); // Vanity Sink Base
-            add(`SB${remainder}`);  // Sink Base
-            
-            // Also try just 'B' or 'DB' if it was a misread Base
-            add(`DB${remainder}`);
-            add(`B${remainder}`);
+            const remainder = cleanCode.replace('WDH', ''); 
+            add(`VDB${remainder}`, 'similar', false);
+            add(`VSB${remainder}`, 'similar', false);
+            add(`SB${remainder}`, 'similar', false);
+            add(`DB${remainder}`, 'similar', false);
+            add(`B${remainder}`, 'similar', false);
         }
     }
     
-    // --- STRATEGY 4: SIMILAR CABINET FALLBACK (Reduction) ---
-    // User Request: "if not match to try with similar cabinet code pricing"
-    // e.g. VDB27AH-3 -> VDB27-3 (Remove middle letters) -> VDB27 (Base)
-    
-    // 4a. Strip middle letters between digits? (e.g. VDB27AH-3 -> VDB27-3)
+    // --- STRATEGY 4: SIMILAR CABINET FALLBACK (Similar) ---
+    // 4a. Strip middle letters: VDB27AH-3 -> VDB27-3
     const middleLetterMatch = cleanCode.match(/^([A-Z0-9]+)(\d{2})([A-Z]+)(-\d+)$/); 
     if (middleLetterMatch) {
-        // [VDB][27][AH][-3] -> VDB27-3
-        add(`${middleLetterMatch[1]}${middleLetterMatch[2]}${middleLetterMatch[4]}`);
+        add(`${middleLetterMatch[1]}${middleLetterMatch[2]}${middleLetterMatch[4]}`, 'similar', true);
     }
 
-    // 4b. Base Fallback (Strip Suffixes entirely)
-    // VDB27AH-3 -> VDB27
+    // 4b. Base Fallback: VDB27AH-3 -> VDB27
     const baseMatch = cleanCode.match(/^([A-Z]+)(\d+)/);
     if (baseMatch) {
-        add(`${baseMatch[1]}${baseMatch[2]}`); // VDB27
-        if (baseMatch[1] === 'VDB') add(`VBD${baseMatch[2]}`); // Typo check
+        add(`${baseMatch[1]}${baseMatch[2]}`, 'similar', true);
     }
 
-    // --- STRATEGY 5: REMOVE INTERNAL DASHES ---
-    // VDB-27-AH-3 -> VDB27AH-3
+    // --- STRATEGY 5: REMOVE INTERNAL DASHES (Exact) ---
     if (cleanCode.split('-').length > 2) {
-         add(cleanCode.replace(/-/g, ''));
+         add(cleanCode.replace(/-/g, ''), 'exact', true);
     }
 
-    // --- STRATEGY 6: CONSTRUCTED KEYS FROM DIMENSIONS ---
+    // --- STRATEGY 6: CONSTRUCTED KEYS FROM DIMENSIONS (Exact/High Confidence) ---
+    // If we have dimensions, these are often MORE reliable than the OCR code.
     if (width > 0) {
         const w = width;
         const h = height;
@@ -310,36 +250,114 @@ const generateSmartKeys = (item: CabinetItem): string[] => {
 
         if (type === 'Wall') {
              const hVal = h || 30;
-             add(`W${w}${hVal}`);
-             if (d > 12) add(`W${w}${hVal}-24`);
+             add(`W${w}${hVal}`, 'exact', false);
+             if (d > 12) add(`W${w}${hVal}-24`, 'exact', false);
         } else if (type === 'Base') {
-             add(`B${w}`);
-             add(`DB${w}`); 
-             add(`SB${w}`); 
-             add(`3DB${w}`);
-             add(`B${w}D`);
+             add(`B${w}`, 'exact', false);
+             add(`DB${w}`, 'exact', false); 
+             add(`SB${w}`, 'exact', false); 
+             add(`3DB${w}`, 'exact', false);
+             add(`B${w}D`, 'exact', false);
         } else if (type === 'Tall') {
              const hVal = h || 84;
-             add(`U${w}${hVal}`);
-             add(`T${w}${hVal}`);
+             add(`U${w}${hVal}`, 'exact', false);
+             add(`T${w}${hVal}`, 'exact', false);
         } else if (type === 'Filler') {
-             add(`F${w}`);
+             add(`F${w}`, 'exact', false);
         } else if (type === 'Panel') {
-             add(`PNL${w}`);
-             add(`BP${w}`);
+             add(`PNL${w}`, 'exact', false);
+             add(`BP${w}`, 'exact', false);
         }
     }
     
-    // --- STRATEGY 7: DEALER VIEW FALLBACK (Aggressive Strip) ---
-    // User: "work as dealer view" -> If we see "SB39AH-2B", we really just want "SB39"
-    // Regex: [Letters][Numbers]... ignore the rest
-    const coreMatch = cleanCode.match(/^([A-Z]+)(\d+)/);
-    if (coreMatch) {
-        // Just the core letters and numbers
-        add(`${coreMatch[1]}${coreMatch[2]}`); 
+    // --- STRATEGY 7: SPECIFIC ABBREVIATION EXPANSION (Similar/Expansion) ---
+    // These are interpretations of abbreviations, so they go to 'similar' or 'exact' depending on confidence.
+    // Since "TEP" is not a valid SKU, these are the ONLY way to match, so they are effectively exact replacements.
+    
+    // S -> SB
+    if (cleanCode.match(/^S\d+$/)) add(cleanCode.replace('S', 'SB'), 'exact', true);
+    
+    // WDH -> WDC
+    if (cleanCode.startsWith('WDH')) {
+         const nums = cleanCode.match(/(\d+)/)?.[0];
+         if (nums) {
+             add(`WDC${nums}30`, 'similar', false);
+             add(`W${nums}30`, 'similar', false);
+         }
     }
 
-    return Array.from(new Set(keys));
+    // PDF -> PNL
+    if (cleanCode.startsWith('PDF')) {
+         const nums = cleanCode.match(/(\d+)/)?.[0];
+         if (nums) {
+             add(`PNL${nums}`, 'exact', false);
+             add(`F${nums}`, 'exact', false);
+         }
+    }
+
+    // OUK -> ACC
+    if (cleanCode.startsWith('OUK')) {
+         const nums = cleanCode.match(/(\d+)/)?.[0];
+         if (nums) {
+             add(`ACC${nums}`, 'similar', false);
+             add(`KIT${nums}`, 'similar', false);
+         }
+    }
+    
+    // CE -> CM
+    if (cleanCode.startsWith('CE')) {
+        add(cleanCode.replace('CE', 'CM'), 'exact', false);
+    }
+
+    // TEP/BEP/REP
+    if (cleanCode.startsWith('TEP')) {
+        add('TEP2484', 'exact', false);
+        add('TEP96', 'exact', false);
+    }
+    if (cleanCode.startsWith('BEP')) {
+        add('BEP24', 'exact', false);
+    }
+    if (cleanCode.startsWith('REP')) {
+        add('REP2496', 'exact', false);
+        add('REP96', 'exact', false);
+    }
+    
+    // Fillers
+    if (cleanCode.startsWith('BF')) {
+         const w = cleanCode.replace('BF', '');
+         add(`F${w}`, 'exact', false);
+         add('F3', 'similar', false); 
+    }
+    if (cleanCode.startsWith('WF')) {
+         const w = cleanCode.replace('WF', '');
+         add(`F${w}`, 'exact', false);
+         add('F3', 'similar', false);
+    }
+    
+    // Generic Fillers
+    if (cleanCode.startsWith('F') && !cleanCode.startsWith('FE')) {
+        const w = cleanCode.replace('F', '');
+        add(`BF${w}`, 'similar', false);
+        add(`WF${w}`, 'similar', false);
+    }
+
+    // --- STRATEGY 8: FUZZY NEIGHBOR MATCHING (Aggressive) ---
+    // Already handled by allowNeighbors=true in Strategy 1/1.5/2
+    // But we can add explicit global neighbors for the clean code here if not already added
+    const core = cleanCode.match(/^([A-Z]+)(\d+)/);
+    if (core) {
+        const prefix = core[1];
+        const numPart = parseInt(core[2]);
+        
+        // Explicit standard sizes fallback
+        if (numPart < 100) {
+            [9, 12, 15, 18, 21, 24, 27, 30, 33, 36, 39, 42, 45, 48].forEach(std => {
+                if (Math.abs(numPart - std) <= 2) add(`${prefix}${std}`, 'similar', false);
+            });
+        }
+    }
+
+    return { exact: exactKeys, similar: similarKeys };
 };
 
 // Helper to normalize lookups consistently with Admin ingestion
@@ -365,23 +383,18 @@ const findCatalogPrice = (
   }
   
   // 2. Hyphen Insensitivity (Remove all dashes)
-  // If cleanSku is VDB27AH-3, catalog might have VDB27AH3
   const skuNoDash = cleanSku.replace(/-/g, '');
   if (catalog[skuNoDash]) return getPriceFromItem(catalog[skuNoDash], tierId, cleanSku, 'Hyphen-Insensitive');
 
-  // 3. Hyphen Insertion for [Letters][Numbers][Letters][Numbers] pattern
-  // Target: VDB27AH3 -> VDB27AH-3
-  // Regex: Ends with [Digit], preceded by [Letter]
+  // 3. Hyphen Insertion
   if (/[A-Z]\d+$/.test(cleanSku)) { 
-      // check if it ends with digit group
       const suffixMatch = cleanSku.match(/(\d+)$/);
       if (suffixMatch) {
           const suffix = suffixMatch[1];
           const prefix = cleanSku.substring(0, cleanSku.length - suffix.length);
-          // Only insert dash if prefix ends with letter
           if (/[A-Z]$/.test(prefix)) {
                const withDash = `${prefix}-${suffix}`;
-               if (catalog[withDash]) return getPriceFromItem(catalog[withDash], tierId, cleanSku, 'Inserted-Hyphen (VDB27AH-3)');
+               if (catalog[withDash]) return getPriceFromItem(catalog[withDash], tierId, cleanSku, 'Inserted-Hyphen');
           }
       }
   }
@@ -404,8 +417,7 @@ const findCatalogPrice = (
       }
   }
 
-  // 5. Fuzzy Suffix Stripping (Iterative)
-  // Limit to reasonable length to avoid matching "B" from "B15"
+  // 5. Fuzzy Suffix Stripping
   for (let i = cleanSku.length - 1; i > 2; i--) {
       const sub = cleanSku.substring(0, i);
       if (catalog[sub]) {
@@ -414,7 +426,7 @@ const findCatalogPrice = (
       }
   }
 
-  // 6. Regex Core Extraction (Letters+Numbers)
+  // 6. Regex Core Extraction
   const heuristic = cleanSku.match(/^([A-Z]{1,4}\d{2,5})/);
   if (heuristic) {
       const core = heuristic[0];
@@ -426,13 +438,27 @@ const findCatalogPrice = (
 
 // Helper to extract specific tier price from item object
 const getPriceFromItem = (item: Record<string, number>, tierId: string, sku: string, method: string) => {
+      // 1. Direct Tier Match
       if (item[tierId] !== undefined) return { price: item[tierId], source: `Catalog (${method} Tier)`, matchedSku: sku };
       
+      // 2. Fuzzy Tier Match (Case insensitive)
       const fuzzyTier = Object.keys(item).find(k => k.toLowerCase().includes(tierId.toLowerCase()) || tierId.toLowerCase().includes(k.toLowerCase()));
       if (fuzzyTier) return { price: item[fuzzyTier], source: `Catalog (${method} Fuzzy '${fuzzyTier}')`, matchedSku: sku };
       
-      const firstKey = Object.keys(item)[0];
-      if (firstKey) return { price: item[firstKey], source: `Catalog (${method} Fallback '${firstKey}')`, matchedSku: sku };
+      // 3. Single Column Fallback (Critical for simple price lists)
+      // If the item only has ONE price column, use it regardless of the requested tier name.
+      // This solves the issue where user selects "Midland" but Excel just has "Price".
+      const keys = Object.keys(item);
+      if (keys.length === 1) {
+          return { price: item[keys[0]], source: `Catalog (${method} Fallback '${keys[0]}')`, matchedSku: sku };
+      }
+
+      // 4. "Price" or "List Price" generic fallback
+      const genericKey = keys.find(k => k.toLowerCase().includes('price') || k.toLowerCase().includes('list'));
+      if (genericKey) return { price: item[genericKey], source: `Catalog (${method} Generic '${genericKey}')`, matchedSku: sku };
+
+      // 5. Last Resort: First Key
+      if (keys.length > 0) return { price: item[keys[0]], source: `Catalog (${method} Blind Fallback '${keys[0]}')`, matchedSku: sku };
       
       return null;
 }
@@ -450,7 +476,6 @@ export const calculateProjectPricing = (
   const checkboxOptions = manufacturer.options?.filter(opt => !!specs?.selectedOptions?.[opt.id]) || [];
 
   // 2. Get Dropdown Options (Match by Name)
-  // We collect the string values from the specs that might correspond to billable options
   const potentialOptionNames = [
       specs?.drawerBox,
       specs?.hingeType, 
@@ -461,23 +486,18 @@ export const calculateProjectPricing = (
       specs?.finishOption2,
       specs?.printedEndOption,
       specs?.wallDoorOption,
-      specs?.baseDoorOption
-  ].filter(val => val && val !== 'None' && val !== 'Standard' && val !== 'No'); // Filter out defaults
+      specs?.baseDoorOption,
+      ...Object.values(specs?.dynamicSelections || {})
+  ].filter(val => val && val !== 'None' && val !== 'Standard' && val !== 'No'); 
 
   const dropdownOptions = manufacturer.options?.filter(opt => 
       potentialOptionNames.some(name => {
           if (!name) return false;
-          // Exact match
-          if (name === opt.name) return true;
-          // Fuzzy match: Check if one contains the other (case-insensitive)
-          const n = name.toLowerCase();
-          const o = opt.name.toLowerCase();
-          return n.includes(o) || o.includes(n);
+          if (name.toLowerCase() === opt.name.toLowerCase()) return true;
+          return false;
       })
   ) || [];
 
-  // Merge options (avoid duplicates if an option is both checked and selected)
-  // Deduplicate by ID and Name to prevent explosion if multiple identical options exist
   const activeOptions = [...checkboxOptions];
   dropdownOptions.forEach(opt => {
       if (!activeOptions.find(o => o.id === opt.id || o.name === opt.name)) {
@@ -489,7 +509,7 @@ export const calculateProjectPricing = (
 
   items.forEach(item => {
     // 0. Garbage Check
-    if (isGarbageItem(item)) return; // Skip this item entirely
+    if (isGarbageItem(item)) return;
 
     let basePrice = 0;
     let source = 'Unknown';
@@ -513,38 +533,71 @@ export const calculateProjectPricing = (
         if (opt.section === 'F-Hinge' && item.type === 'Panel') applies = false;
         if (opt.name.toLowerCase().includes('wall') && item.type !== 'Wall') applies = false;
         if (opt.name.toLowerCase().includes('base') && item.type !== 'Base') applies = false;
+        if (opt.name.length > 50 && opt.price === 0) applies = false;
 
         if (applies) {
             let addPrice = 0;
             if (opt.pricingType === 'fixed') addPrice = opt.price;
-            if (addPrice > 0) {
+            
+            if (addPrice > 0 || (opt.price === 0 && opt.name.length < 50)) {
                 optionsPrice += addPrice;
                 appliedOptionsLog.push({ name: opt.name, price: addPrice, sourceSection: opt.section });
             }
         }
     });
 
-    // 3. BASE PRICE
+    // 3. BASE PRICE LOOKUP
     let match: any = null;
-    const smartKeys = generateSmartKeys(item);
+    const { exact, similar } = generateSmartKeys(item);
     
     // Pass 1: Try exact/fuzzy match on ORIGINAL code
     match = findCatalogPrice(item.originalCode, manufacturer.catalog || {}, tierNameForLookup, true);
 
-    // Pass 2: Try smart keys STRICTLY
+    // Pass 2: Try EXACT keys STRICTLY
     if (!match) {
-        for (const key of smartKeys) {
+        for (const key of exact) {
             match = findCatalogPrice(key, manufacturer.catalog || {}, tierNameForLookup, true);
             if (match) {
-                match.source = `Catalog (Similar '${key}')`;
+                match.source = `Catalog (Exact Match '${key}')`;
                 break;
             }
         }
     }
     
-    // Pass 3: Fallback to Fuzzy/Loose matching on Original Code
+    // Pass 3: Try SIMILAR keys STRICTLY
+    if (!match) {
+        for (const key of similar) {
+            match = findCatalogPrice(key, manufacturer.catalog || {}, tierNameForLookup, true);
+            if (match) {
+                match.source = `Catalog (Similar Match '${key}')`;
+                break;
+            }
+        }
+    }
+    
+    // Pass 4: Fallback to Fuzzy/Loose matching on Original Code
     if (!match) {
         match = findCatalogPrice(item.originalCode, manufacturer.catalog || {}, tierNameForLookup, false);
+    }
+
+    // Pass 5: GLOBAL CATALOG SEARCH (The "Full XLSM" Fallback)
+    // If we still haven't found it, iterate the entire catalog keys to find a partial match.
+    // This addresses the user request: "if not match then try to match with full xlsm"
+    if (!match) {
+        const catalogKeys = Object.keys(manufacturer.catalog || {});
+        // 5a. Look for catalog key that STARTS WITH the normalized code (e.g. SKU="B15", Catalog="B15-L")
+        // We sort by length ascending to find the shortest (simplest) match first
+        const cleanSku = normalizeLookup(item.originalCode);
+        if (cleanSku && cleanSku !== "UNKNOWN") {
+            const potentialMatch = catalogKeys.find(k => {
+                 const normK = normalizeLookup(k);
+                 return normK.startsWith(cleanSku) && normK.length <= cleanSku.length + 3; // Allow up to 3 extra chars (e.g. -L, -R)
+            });
+            
+            if (potentialMatch) {
+                match = getPriceFromItem(manufacturer.catalog![potentialMatch], tierNameForLookup, potentialMatch, `Catalog (Global Prefix Match '${potentialMatch}')`);
+            }
+        }
     }
     
     if (match) {
@@ -561,13 +614,12 @@ export const calculateProjectPricing = (
 
     // 4. PERCENTAGE OPTIONS
     activeOptions.forEach(opt => {
-         if (opt.section === 'D-Finish' || opt.pricingType === 'percentage') {
-             // Safety: Normalize percentage. If > 1 (e.g. 15), treat as 15% (0.15). 
-             // Exception: If > 4 (400%), it's likely an error, but we'll cap or assume integer pct.
+         if (opt.pricingType === 'percentage') {
              let pct = opt.price;
              if (pct > 1) pct = pct / 100;
-             
              const addPrice = basePrice * pct; 
+             if (opt.name.length > 50 && addPrice === 0) return;
+
              optionsPrice += addPrice;
              appliedOptionsLog.push({ name: `${opt.name} (${(pct*100).toFixed(0)}%)`, price: addPrice, sourceSection: opt.section });
          }
@@ -592,24 +644,15 @@ export const calculateProjectPricing = (
     });
   });
 
-  // Sort Results: Type Priority then Code
+  // Sort Results
   const typePriority: Record<string, number> = {
-      'Base': 1,
-      'Wall': 2,
-      'Tall': 3,
-      'Panel': 4,
-      'Filler': 5,
-      'Accessory': 6,
-      'Modification': 7
+      'Base': 1, 'Wall': 2, 'Tall': 3, 'Panel': 4, 'Filler': 5, 'Accessory': 6, 'Modification': 7
   };
 
   return results.sort((a, b) => {
-      // 1. Sort by Type
       const typeA = typePriority[a.type || 'Base'] || 99;
       const typeB = typePriority[b.type || 'Base'] || 99;
       if (typeA !== typeB) return typeA - typeB;
-
-      // 2. Sort by Code (Alpha then Numeric)
       return a.originalCode.localeCompare(b.originalCode, undefined, { numeric: true, sensitivity: 'base' });
   });
 };

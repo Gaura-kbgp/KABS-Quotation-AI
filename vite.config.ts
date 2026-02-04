@@ -16,7 +16,17 @@ export default defineConfig(({ mode }) => {
     },
     build: {
       outDir: 'dist',
-      sourcemap: false
+      sourcemap: false,
+      rollupOptions: {
+        output: {
+          manualChunks: {
+            'vendor-react': ['react', 'react-dom', 'react-router-dom'],
+            'vendor-pdf': ['pdfjs-dist', 'jspdf', 'jspdf-autotable'],
+            'vendor-excel': ['xlsx', 'jszip'],
+            'vendor-ui': ['lucide-react']
+          }
+        }
+      }
     }
   };
 });

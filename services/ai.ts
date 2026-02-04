@@ -1,4 +1,4 @@
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI } from "@google/genai";
 import { CabinetItem, ProjectSpecs, CabinetType } from "../types";
 import { normalizeNKBACode } from "./pricingEngine";
 
@@ -6,64 +6,62 @@ import { normalizeNKBACode } from "./pricingEngine";
 const getAI = () => new GoogleGenAI({ apiKey: import.meta.env.VITE_GEMINI_API_KEY });
 
 // Updated to 2.5 series as per user request (2026 models)
-const MODEL_NAME = 'gemini-2.5-pro'; 
-const FAST_MODEL_NAME = 'gemini-2.5-flash'; 
+const MODEL_NAME = 'gemini-2.5-flash'; // Switched to Flash for speed
+const PRO_MODEL_NAME = 'gemini-2.5-pro'; // Keep Pro as fallback/option 
 
 const SYSTEM_INSTRUCTION = `
-ROLE: Expert Cabinetry Quantity Surveyor & AI Vision Analyst.
+You are KABS Quotation AI, an expert kitchen cabinet estimator.
 
-TASK: Extract a COMPREHENSIVE, 100% ACCURATE Bill of Materials from the provided architectural plans, elevations, or quote tables.
+GOAL: Extract EVERY cabinet code from the provided document (PDF or Images).
+INPUT: Either extracted text from a PDF OR a sequence of images.
+OUTPUT: A JSON object with "scratchpad", "specs", and "items".
 
-INPUT: PDF or Image containing drawings, schedules, or tables.
+INTELLIGENCE RULES:
+1.  **Analyze All Input**: If text is provided, read it all. If images are provided, analyze every page.
+2.  **Find Codes**: Identify cabinet codes (e.g., "B30", "W3030", "VDB27", "SB36").
+3.  **Infer Missing Codes**: If a cabinet has dimensions but no code (e.g., a 30" wide Base), construct the code "B30". Use "W{width}{height}" for walls.
+4.  **Filter Noise**: Exclude appliances (Fridge, Stove, DW) unless they are cabinet enclosures/panels. Exclude electrical/plumbing symbols.
+5.  **Grouping**: Group findings by page in the "scratchpad" field.
+6.  **Deduplicate**: If the SAME cabinet appears multiple times (e.g. Plan vs Elevation), count it ONLY ONCE.
+7.  **Text Mode**: If analyzing raw text, assume it is a Cabinet List/Quote. Extract the codes and quantities directly.
 
-CRITICAL OBJECTIVE: HIGH RECALL.
-- You must find EVERY cabinet code.
-- If there are 19 cabinets in the plan, you MUST output 19 items.
-- If you only find 4, you have FAILED.
-- Scan the entire image/PDF pixel-by-pixel, top-to-bottom, left-to-right.
-- CHECK ALL PAGES. Do not stop after Page 1.
-
-OUTPUT REQUIREMENT:
-You must output a SINGLE JSON object containing 'specs' and 'items'.
-
-CRITICAL EXTRACTION RULES:
-1. **EXHAUSTIVE LISTING (NO SUMMARIZATION)**:
-   - If the document contains a table with 20 rows, your JSON 'items' array MUST have 20 objects.
-   - **DO NOT GROUP**: Do not output "3x Base Cabinet". Output 3 separate entries.
-   - **Visual Search**: In drawing/plan views, look for codes (e.g., "B15", "W3030", "SB36") attached to rectangles.
-   - **Review**: After extracting, look again. Did you miss any text labels?
-
-2. **DEALING WITH DRAWINGS (ELEVATIONS/PLANS)**:
-   - OCR every text label that looks like a cabinet code.
-   - Look for labels pointing to cabinets, e.g., "W3024", "B21L", "PB36", "MW.HOOD".
-   - Codes are often written directly on the cabinet face in the drawing.
-   - **Duplicate Codes**: If "B15" appears in two places on the floor plan, that means there are TWO B15 cabinets. Extract BOTH.
-
-3. **FILTERING (BE SMART)**:
-   - INCLUDE: Cabinets, Fillers, Panels, Moldings, Accessories, Wood Hoods, "Sink Base", "Oven Cabinet", "Microwave Cabinet".
-   - EXCLUDE: The actual appliances (Fridge, Stove, Dishwasher), Sinks, Faucets, Electrical, Plumbing.
-   - **Ambiguity Rule**: If you are unsure if something is a cabinet or an appliance, INCLUDE IT. It is better to have an extra item than to miss a cabinet.
-
-JSON SCHEMA:
-{
-  "specs": {
-    "manufacturer": "string",
-    "doorStyle": "string", 
-    "finish": "string",
-    "notes": "string"
-  },
-  "items": [
-    {
-      "code": "string (EXACT text found, e.g. 'VDB24-AH')",
-      "qty": number (default 1),
-      "description": "string",
-      "width": number (extract from code or desc if available, else 0),
-      "height": number,
-      "depth": number
-    }
-  ]
-}
+Your extraction must be exhaustive and accurate.
 `;
+
+// Helper: Consolidate identical items to prevent duplicates from multiple views
+function consolidateItems(items: any[]): any[] {
+    const map = new Map<string, any>();
+
+    items.forEach(item => {
+        // Create a unique key for aggregation
+        // We normalize the code to uppercase and remove spaces
+        const normCode = (item.normalizedCode || item.originalCode || "").toUpperCase().replace(/\s+/g, '');
+        // We round dimensions to avoid floating point mismatches (e.g. 30.0 vs 30)
+        const w = Math.round(item.width || 0);
+        const h = Math.round(item.height || 0);
+        const d = Math.round(item.depth || 0);
+        // We sort modifications to ensure order doesn't matter
+        const mods = (item.modifications || []).map((m: any) => (m.description || "").trim()).sort().join('|');
+        
+        // Key includes type to differentiate Base vs Wall if codes are ambiguous
+        const key = `${normCode}_${item.type}_${w}x${h}x${d}_${mods}`;
+
+        if (map.has(key)) {
+            const existing = map.get(key);
+            existing.quantity += (item.quantity || 1); // Fix: use item.quantity not item.qty (mapped items use quantity)
+            // Merge notes if different
+            if (item.notes && !existing.notes.includes(item.notes)) {
+                existing.notes += "; " + item.notes;
+            }
+        } else {
+            // Clone item to avoid mutation side effects
+            map.set(key, { ...item, quantity: item.quantity || 1 });
+        }
+    });
+
+    return Array.from(map.values());
+}
+
 
 // Helper to clean and parse JSON resiliently
 function safeJSONParse(text: string): any {
@@ -87,7 +85,7 @@ function safeJSONParse(text: string): any {
     // Fix 5: Missing comma between strings (e.g. "a" "b" -> "a", "b")
     clean = clean.replace(/"\s*"/g, '","');
 
-    // Fix 6: Missing comma after number in array (e.g. [1 2] -> [1, 2])
+    // Fix 6: Missing comma after number in array (e.g. [1, 2] -> [1, 2])
     clean = clean.replace(/(\d+)\s+(\d+)/g, '$1, $2');
 
     // Fix 7: Missing comma after number before quote (e.g. 1 "a" -> 1, "a")
@@ -100,67 +98,16 @@ function safeJSONParse(text: string): any {
         return String(Math.round(parseFloat(match) * 100) / 100);
     });
 
+    // Fix 10: Missing comma between closing bracket and number (e.g. [1, 2] 3 -> [1, 2], 3)
+    clean = clean.replace(/\]\s*(\d+)/g, '], $1');
+
     try {
         return JSON.parse(clean);
     } catch (e) {
-        console.warn("JSON Parse Error. Attempting auto-repair...", e);
-        try {
-            // Aggressive Repair 1: Try to find the valid JSON object wrapper
-            let start = clean.indexOf('{');
-            let end = clean.lastIndexOf('}');
-            
-            // If we have a start but the end is "too early" (likely inside an item), 
-            // check if we have an unclosed array.
-            if (start !== -1) {
-                let candidate = clean.substring(start, end + 1);
-                
-                // If the candidate doesn't end with } or ]}, it might be truncated.
-                // But lastIndexOf('}') guarantees it ends with }.
-                // The problem is if the array ] is missing.
-                
-                // Check if braces/brackets are balanced
-                const openBraces = (candidate.match(/{/g) || []).length;
-                const closeBraces = (candidate.match(/}/g) || []).length;
-                const openBrackets = (candidate.match(/\[/g) || []).length;
-                const closeBrackets = (candidate.match(/\]/g) || []).length;
-                
-                if (openBrackets > closeBrackets) {
-                    // We are likely inside an open array.
-                    // Let's try to close it.
-                    // Find the last complete object closing `},` or `}` inside the array.
-                    // Strategy: Cut off at the last `}` and append `]}`
-                    candidate = candidate + "]}"; 
-                }
-                
-                try { return JSON.parse(candidate); } catch (e2) {}
-                
-                // Aggressive Repair 2: Truncate to last known good object
-                // If the JSON is like { items: [ {good}, {good}, {ba
-                // We want to keep the good ones.
-                const lastGoodObj = clean.lastIndexOf('},');
-                if (lastGoodObj > start) {
-                     let truncated = clean.substring(start, lastGoodObj + 1) + "]}";
-                     try { return JSON.parse(truncated); } catch (e3) {}
-                }
-            }
-            
-            // Original repair logic as fallback
-            if (start !== -1 && end !== -1) {
-                let jsonStr = clean.substring(start, end + 1);
-                jsonStr = jsonStr.replace(/,\s*([\]}])/g, '$1'); 
-                jsonStr = jsonStr.replace(/}\s*{/g, '},{');
-                jsonStr = jsonStr.replace(/]\s*"/g, '],"');
-                jsonStr = jsonStr.replace(/}\s*"/g, '},"');
-                jsonStr = jsonStr.replace(/"\s*"/g, '","');
-                jsonStr = jsonStr.replace(/(\d+)\s+(\d+)/g, '$1, $2');
-                return JSON.parse(jsonStr);
-            }
-            throw new Error("No valid JSON object found");
-        } catch (repairError) {
-            console.error("JSON Repair Failed:", repairError);
-            console.error("Bad JSON Content:", clean); // Log content for debugging
-            return { items: [], specs: {} };
-        }
+        console.error("JSON Parse Failed. Raw text:", text.substring(0, 200) + "...");
+        console.error("Cleaned text:", clean.substring(0, 200) + "...");
+        console.error("Parse Error:", e);
+        return { items: [], specs: {} };
     }
 }
 
@@ -230,6 +177,303 @@ const resizeImageIfNeeded = async (file: File): Promise<string> => {
     });
 }
 
+import { convertPdfToImages, extractTextFromPdf } from "./pdfUtils";
+
+// --- NEW: Local Heuristic Extraction to Bypass AI for Simple Lists ---
+function tryLocalRegexExtraction(text: string): CabinetItem[] {
+    const items: CabinetItem[] = [];
+    const seenCodes = new Set<string>(); // avoid duplicates on same line
+    
+    // Pattern 1: Standard Cabinet Code (e.g. B30, W3030, VDB27AH-3)
+    // Needs to be fairly strict to avoid matching random text
+    // Matches: Start of word, [A-Z]{1,4} prefix, \d{2,} dimensions, optional suffix
+    const codeRegex = /\b([A-Z]{1,4}\d{2,}[A-Z0-9-]*)\b/g;
+    
+    // Pattern 2: Tabular Quantity detection (Number at start of line or near code)
+    // This is hard to do perfectly with regex, so we'll look for lines that have a code
+    
+    const lines = text.split('\n');
+    
+    for (const line of lines) {
+        // Skip obvious junk lines
+        if (line.length < 5) continue;
+        if (line.includes('Page') && line.includes('of')) continue;
+        
+        const matches = [...line.matchAll(codeRegex)];
+        if (matches.length === 0) continue;
+        
+        // Find quantity if possible (look for number before the code)
+        let qty = 1;
+        const qtyMatch = line.match(/^(\d+)\s+/); // Number at start of line
+        if (qtyMatch) {
+            qty = parseInt(qtyMatch[1], 10);
+            if (qty > 100 || qty < 1) qty = 1; // Safety
+        }
+        
+        for (const match of matches) {
+            const code = match[1];
+            // Filter invalid codes (like dates, years, phone numbers)
+            if (code.match(/^\d{4}/)) continue; // Year like 2024
+            if (code.length > 20) continue; // Too long
+            
+            // Basic Type Inference
+            let type: CabinetType = 'Base';
+            if (code.startsWith('W')) type = 'Wall';
+            else if (code.startsWith('T') || code.startsWith('U')) type = 'Tall';
+            else if (code.startsWith('V')) type = 'Accessory'; // Vanity or Valance
+            
+            items.push({
+                id: `local_${Date.now()}_${items.length}`,
+                originalCode: code,
+                quantity: qty,
+                type: type,
+                description: "Fast Scan Item", // Placeholder
+                width: 0, height: 0, depth: 0,
+                normalizedCode: code
+            });
+        }
+    }
+    
+    return items;
+}
+
+export async function extractManufacturerSpecs(file: File): Promise<any> {
+    console.log("AI Spec Extraction: Starting...");
+    const contentsParts: any[] = [];
+    let processedWithText = false;
+
+    // 1. FAST PATH: Text Extraction
+    try {
+         console.log("Attempting fast text extraction for Specs...");
+         const rawText = await extractTextFromPdf(file);
+         if (rawText.length > 200) {
+             contentsParts.push({ text: `*** DOCUMENT TEXT EXTRACTED ***
+             The user uploaded a Manufacturer Specification PDF.
+             Below is the raw text content of the file.
+             
+             CRITICAL INSTRUCTION:
+             1. Scan the ENTIRE text below.
+             2. Extract ALL configurable cabinetry options as per the instructions.
+             3. Note that the text may contain multiple pages separated by "--- PAGE X ---". You must read ALL pages.
+             
+             RAW TEXT CONTENT:
+             ${rawText}
+             ***` });
+             processedWithText = true;
+         }
+    } catch (e) {
+        console.warn("Spec Text Extraction failed, falling back to Vision", e);
+    }
+    
+    // 2. SLOW PATH: Vision (Fallback)
+    if (!processedWithText) {
+        try {
+            let mimeType = file.type;
+            if (!mimeType) mimeType = file.name.endsWith('.pdf') ? 'application/pdf' : 'image/jpeg';
+
+            if (mimeType === 'application/pdf') {
+                const pdfImages = await convertPdfToImages(file);
+                // Limit to first 20 pages to avoid timeouts/limits, but user asked for "Read Full PDF"
+                // Vision is expensive. If text failed, this is a scanned doc. 
+                // We'll do 15 pages as a reasonable compromise for "Full PDF" in vision mode.
+                const limit = Math.min(pdfImages.length, 15); 
+                
+                console.log(`Processing first ${limit} pages of Spec Book (Vision Mode)...`);
+                
+                for(let i=0; i<limit; i++) {
+                    const img = pdfImages[i];
+                    contentsParts.push({
+                        inlineData: {
+                            mimeType: img.mimeType,
+                            data: img.data
+                        }
+                    });
+                    contentsParts.push({ text: `[--- PAGE ${img.pageNumber} ---]` });
+                }
+            } else {
+                const base64 = await resizeImageIfNeeded(file);
+                contentsParts.push({ inlineData: { mimeType, data: base64 } });
+            }
+        } catch (e) {
+            console.error("Spec Image Conversion Failed", e);
+            throw new Error("Failed to process Spec file for AI analysis.");
+        }
+    }
+
+    const SPEC_SYSTEM_INSTRUCTION = `
+ You are a Senior Interior Quotation AI working for a professional cabinetry quotation system. 
+ 
+ Your task is to READ and UNDERSTAND the uploaded Manufacturer Specification PDF 
+ and dynamically generate a SPECIFICATION CONFIGURATION for a Kitchen Cabinet quotation UI. 
+ 
+ ======================== 
+ CONTEXT 
+ ======================== 
+ • User has selected a Manufacturer from a dropdown 
+ • A manufacturer specification PDF is uploaded 
+ • This PDF is the ONLY source of truth 
+ • Ignore plumbing, electrical, appliances, delivery, warranty, and legal pages 
+ • Focus ONLY on INTERIOR CABINETRY specifications 
+ 
+ ======================== 
+ OBJECTIVE 
+ ======================== 
+ When a manufacturer is selected: 
+ 1. Read the PDF completely 
+ 2. Extract ALL configurable cabinetry options 
+ 3. Convert them into a structured, dynamic specification form 
+ 4. Output JSON that can directly drive a React UI 
+ 
+ ======================== 
+ WHAT TO EXTRACT FROM PDF 
+ ======================== 
+ From the specification guide, identify and group: 
+ 
+ 1. Door Style 
+    - Series (Elite / Premium / Prime / Choice) 
+    - Door Style Name (Canyon, Durango, Abilene, etc.) 
+    - Overlay type (Full Overlay / Partial Overlay) 
+    - Panel type (Slab / Recessed / Raised / Mitered) 
+    - OFD / DFO / MFD availability 
+ 
+ 2. Finish Options 
+    - Wood species (Maple, Cherry, etc.) 
+    - Painted finishes 
+    - Duraform finishes 
+    - Glaze finishes 
+    - Mark Premium / Standard finishes 
+    - Ensure only finishes VALID for the selected door style appear 
+ 
+ 3. Cabinet Construction 
+    - Box material 
+    - Shelves type 
+    - Drawer system 
+    - Hinge type 
+    - Soft close options 
+    - Toe kick options (Standard / Recessed / Void) 
+    - All plywood option (if available) 
+ 
+ 4. Cabinet Categories (NO QUANTITY HERE) 
+    - Base Cabinets 
+    - Wall Cabinets 
+    - Tall Cabinets 
+    - Vanity Cabinets 
+    - Accessories (only cabinetry-related) 
+ 
+ 5. Optional Upgrades 
+    - CushionClose drawers 
+    - CushionClose hinges 
+    - Matching interior 
+    - Full depth shelves 
+    - Reduced / Increased depth 
+    - Furniture ends 
+    - Decorative panels 
+ 
+ ======================== 
+ STRICT RULES 
+ ======================== 
+ • DO NOT guess 
+ • DO NOT hallucinate options not found in PDF 
+ • DO NOT merge incompatible finishes or door styles 
+ • If an option is not available for a door style → exclude it 
+ • Ignore pricing unless explicitly mentioned as an option 
+ • Output MUST be deterministic and structured 
+ 
+ ======================== 
+ OUTPUT FORMAT (MANDATORY) 
+ ======================== 
+ Return JSON ONLY in this structure: 
+ 
+ { 
+   "manufacturer": "Name Detected from PDF", 
+   "specificationSections": [ 
+     { 
+       "section": "Door Style", 
+       "type": "select", 
+       "options": [ 
+         { 
+           "series": "Elite", 
+           "name": "Canyon", 
+           "overlay": "Full Overlay", 
+           "panel": "Recessed", 
+           "supports": ["OFD", "DFO"] 
+         } 
+       ] 
+     }, 
+     { 
+       "section": "Finish", 
+       "type": "dependent-select", 
+       "dependsOn": "Door Style", 
+       "options": [ 
+         { 
+           "doorStyle": "Canyon", 
+           "finishes": { 
+             "Painted": ["Oat", "Navy", "Sage"], 
+             "Wood": ["Maple Cider", "Maple Latte"], 
+             "Duraform": ["Breeze", "Drift"] 
+           } 
+         } 
+       ] 
+     }, 
+     { 
+       "section": "Construction Options", 
+       "type": "checkbox-group", 
+       "options": [ 
+         "Soft Close Hinges", 
+         "Soft Close Drawers", 
+         "All Plywood Box", 
+         "Matching Interior" 
+       ] 
+     }, 
+     { 
+       "section": "Toe Kick", 
+       "type": "radio", 
+       "options": ["Standard", "Recessed", "Void"] 
+     } 
+   ] 
+ } 
+ 
+ ======================== 
+ FINAL INSTRUCTION 
+ ======================== 
+ Think like a cabinet manufacturer product engineer. 
+ Accuracy is more important than completeness. 
+ If data is missing → omit the option.
+    `;
+
+    contentsParts.push({ text: SPEC_SYSTEM_INSTRUCTION });
+
+    const ai = getAI();
+    // Using a simpler schema because the user's requested schema is complex and recursive/varied
+    // We will let the prompt drive the structure and just request JSON
+    const generationConfig = {
+        temperature: 0.2,
+        maxOutputTokens: 8192,
+        responseMimeType: "application/json"
+    };
+
+    try {
+        const result = await ai.models.generateContent({
+            model: MODEL_NAME,
+            contents: { parts: contentsParts },
+            config: generationConfig
+        });
+
+        let text = "";
+        const r = result as any;
+        if (typeof r.text === 'function') text = r.text();
+        else if (r.response && typeof r.response.text === 'function') text = r.response.text();
+        else text = JSON.stringify(r);
+
+        const parsed = safeJSONParse(text);
+        return parsed;
+
+    } catch (err) {
+        console.error("AI Spec Extraction Error:", err);
+        return { manufacturer: "Unknown", specificationSections: [] };
+    }
+}
+
 export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise<{ 
     specs: ProjectSpecs, 
     items: CabinetItem[] 
@@ -243,10 +487,147 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
         else mimeType = 'application/pdf'; // Default to PDF if unknown
     }
 
-    let base64Data: string;
+    let contentsParts: any[] = [];
 
-    // Only resize if it is an image
-    if (mimeType.startsWith('image/')) {
+    // --- NEW LOGIC: PDF -> IMAGE CONVERSION ---
+    if (mimeType === 'application/pdf') {
+        let processedWithText = false;
+        
+        // 1. FAST PATH: Attempt Text Extraction & Local Regex Heuristics
+        try {
+             console.log("Attempting fast text extraction...");
+             const rawText = await extractTextFromPdf(file);
+             
+             // --- INSTANT LOCAL EXTRACTION (BYPASS AI) ---
+             const localItems = tryLocalRegexExtraction(rawText);
+             if (localItems.length >= 5) {
+                 console.log(`INSTANT SCAN SUCCESS: Found ${localItems.length} items using local regex. Bypassing AI.`);
+                 // Return immediately with locally found items
+                 return {
+                     specs: {
+                         manufacturer: "Detected from PDF (Fast Scan)",
+                         notes: "Extracted via Fast Scan"
+                     },
+                     items: consolidateItems(localItems)
+                 };
+             }
+             // --------------------------------------------
+
+             // Heuristic: Does the text look like a cabinet list?
+             // Look for patterns like B30, W3030, SB36, VDB, etc.
+             // Also look for tabular headers like "Qty", "Description"
+             const codeMatches = rawText.match(/\b(B\d{2}|W\d{4}|SB\d{2}|DB\d{2}|VDB|LS\d{2}|OC\d{2}|[A-Z]{1,3}\d{2,})\b/g) || [];
+             const hasListKeywords = /Qty|Quantity|Description|Item|Schedule/i.test(rawText);
+             
+             // If we found significant codes (>5) and text length is substantial, use Text Only mode
+             // Or if we found some codes AND list keywords, trust it more
+             // This avoids the expensive image rendering step
+             const isRichText = rawText.length > 200;
+             const seemsLikeList = (codeMatches.length > 5) || (codeMatches.length > 2 && hasListKeywords);
+
+             if (isRichText && seemsLikeList) {
+                  console.log(`Fast Path: Detected ${codeMatches.length} potential codes. Skipping Image Rasterization.`);
+                  
+                  // Optimize Text: Collapse multiple spaces to one, but PRESERVE NEWLINES for list structure
+                  const optimizedText = rawText.replace(/[ \t]+/g, ' ').replace(/\n\s*\n/g, '\n');
+                  
+                  contentsParts.push({ text: `*** DOCUMENT TEXT EXTRACTED (OPTIMIZED) ***
+                  The user uploaded a PDF that contains readable text (likely an Order Acknowledgment or Quote). 
+                  Below is the raw text content of the file.
+                  
+                  CRITICAL INSTRUCTION:
+                  1. Scan the ENTIRE text below.
+                  2. Extract ALL cabinet codes found in the text.
+                  3. IGNORE page headers/footers if they are just metadata.
+                  4. Note that the text may contain multiple pages separated by "--- PAGE X ---". You must read ALL pages.
+                  
+                  RAW TEXT CONTENT:
+                  ${optimizedText}
+                  ***` });
+                  
+                  processedWithText = true;
+             }
+        } catch (textErr) {
+             console.warn("Text extraction failed/inadequate, continuing to image processing...", textErr);
+        }
+
+        // 2. SLOW PATH: Vision Analysis (Fallback)
+        if (!processedWithText) {
+            try {
+                console.log("Detecting PDF... Converting pages to images for improved AI recall...");
+                const pdfImages = await convertPdfToImages(file);
+                
+                if (pdfImages.length === 0) {
+                    throw new Error("PDF processing failed: No pages found.");
+                }
+
+                console.log(`Successfully converted ${pdfImages.length} PDF pages to images.`);
+
+                // OPTIMIZATION: If too many pages (>20), fallback to text-only mode for the remaining pages or warn user
+                // Or better: Only send the first 20 pages as images, and the rest as text if possible?
+                // For now, let's limit to 15 images to prevent timeouts
+                const MAX_IMAGES = 15;
+                const imagesToProcess = pdfImages.slice(0, MAX_IMAGES);
+
+                contentsParts.push({ text: `*** DOCUMENT INFO: This PDF contains ${pdfImages.length} pages. 
+                Processing first ${imagesToProcess.length} pages as images for high precision.
+                
+                CRITICAL INSTRUCTION:
+                You MUST iterate through ALL provided images.
+                You MUST extract cabinets from EACH page. 
+                
+                REQUIRED SCRATCHPAD FORMAT:
+                You must start your scratchpad with:
+                "Analyzing Page 1..."
+                [findings for page 1]
+                "Analyzing Page 2..."
+                [findings for page 2]
+                ...and so on.
+                ***` });
+
+                // Add each page as a separate image part
+                imagesToProcess.forEach(img => {
+                    contentsParts.push({
+                        inlineData: {
+                            mimeType: img.mimeType,
+                            data: img.data
+                        }
+                    });
+                    // Add a text separator to help AI distinguish pages
+                    contentsParts.push({ text: `[--- IMAGE FOR PAGE ${img.pageNumber} ---]` });
+                });
+                
+                if (pdfImages.length > MAX_IMAGES) {
+                     contentsParts.push({ text: `[--- WARNING: DOCUMENT TRUNCATED AT PAGE ${MAX_IMAGES}. USER HAS MORE PAGES BUT SYSTEM LIMIT REACHED ---]` });
+                }
+
+            } catch (pdfErr) {
+                console.error("PDF Rasterization failed. Falling back to raw PDF upload.", pdfErr);
+                // Fallback: Upload raw PDF if rasterization fails
+                // For PDFs, check size limit (Gemini Inline Data Limit is ~20MB safety margin)
+                const MAX_PDF_SIZE = 19 * 1024 * 1024; // 19MB to be safe
+                if (file.size > MAX_PDF_SIZE) {
+                    throw new Error(`File too large (${(file.size / 1024 / 1024).toFixed(1)}MB). Limit is 19MB. Please compress the PDF or split it.`);
+                }
+
+                const base64Data = await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = () => resolve(cleanBase64(reader.result as string));
+                    reader.onerror = reject;
+                    reader.readAsDataURL(file);
+                });
+
+                contentsParts.push({
+                    inlineData: {
+                        mimeType: 'application/pdf',
+                        data: base64Data
+                    }
+                });
+            }
+        }
+    } else {
+        // IMAGE HANDLING
+        let base64Data: string;
         try {
             base64Data = await resizeImageIfNeeded(file);
         } catch (e) {
@@ -258,95 +639,112 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
                 reader.readAsDataURL(file);
             });
         }
-    } else {
-        // For PDFs, check size limit (Gemini Inline Data Limit is ~20MB safety margin)
-        const MAX_PDF_SIZE = 19 * 1024 * 1024; // 19MB to be safe
-        if (file.size > MAX_PDF_SIZE) {
-            throw new Error(`File too large (${(file.size / 1024 / 1024).toFixed(1)}MB). Limit is 19MB. Please compress the PDF or split it.`);
-        }
-
-        // For PDFs, read directly without resizing
-        base64Data = await new Promise((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onload = () => resolve(cleanBase64(reader.result as string));
-            reader.onerror = reject;
-            reader.readAsDataURL(file);
+        contentsParts.push({
+            inlineData: {
+                mimeType: mimeType,
+                data: base64Data
+            }
         });
     }
+
+    // Add System Instruction at the end
+    contentsParts.push({ text: SYSTEM_INSTRUCTION });
 
     try {
         const ai = getAI();
         
-        const contentsParts: any[] = [
-            { 
-                inlineData: { 
-                    mimeType: mimeType, 
-                    data: base64Data 
-                } 
-            },
-            { text: SYSTEM_INSTRUCTION }
-        ];
+        // Log parts structure for debugging
+        console.log(`Sending ${contentsParts.length} parts to Gemini AI...`);
+
+        // Check if token limit is sufficient for 19 pages output
+    const generationConfig = {
+        temperature: 0.2, // Low temperature for factual extraction
+        maxOutputTokens: 65536, // Maximize for multi-page output (Gemini 2.5 Flash supports huge context)
+        responseMimeType: "application/json",
+        responseSchema: {
+            type: "OBJECT",
+            properties: {
+                scratchpad: { type: "STRING", description: "Raw list of all potential codes found, GROUPED BY PAGE NUMBER (e.g. 'Page 1:', 'Page 2:')" },
+                specs: {
+                        type: "OBJECT",
+                        properties: {
+                            manufacturer: { type: "STRING", description: "Manufacturer Name" },
+                            doorStyle: { type: "STRING", description: "Door Style Name" },
+                            finish: { type: "STRING", description: "Finish/Color Name" },
+                            construction: { type: "STRING", description: "Construction specs" },
+                            notes: { type: "STRING", description: "Project notes" }
+                        }
+                    },
+                    items: {
+                        type: "ARRAY",
+                        items: {
+                            type: "OBJECT",
+                            properties: {
+                                code: { type: "STRING", description: "Exact Product Code (e.g. VDB27AH-3). IF TEXT IS MISSING, CONSTRUCT NKBA CODE (e.g. B15, W3030) FROM DIMS. NEVER RETURN 'UNKNOWN'." },
+                                normalizedCode: { type: "STRING", description: "NKBA equivalent code" },
+                                qty: { type: "NUMBER" },
+                                type: { type: "STRING", description: "Base, Wall, Tall, Filler, Panel, Accessory" },
+                                description: { type: "STRING" },
+                                width: { type: "NUMBER" },
+                                height: { type: "NUMBER" },
+                                depth: { type: "NUMBER" },
+                                extractedPrice: { type: "NUMBER" },
+                                modifications: {
+                                    type: "ARRAY",
+                                    items: {
+                                        type: "OBJECT",
+                                        properties: {
+                                            description: { type: "STRING" },
+                                            price: { type: "NUMBER" }
+                                        }
+                                    }
+                                },
+                                notes: { type: "STRING" }
+                            },
+                            required: ["code", "qty", "type", "description"]
+                        }
+                    }
+                },
+                required: ["items", "specs"]
+            }
+        };
 
         const response = await callAIWithRetry(async () => {
             const result = await ai.models.generateContent({
                 model: MODEL_NAME,
                 contents: { parts: contentsParts },
-                config: {
-                    responseMimeType: "application/json",
-                    responseSchema: {
-                        type: Type.OBJECT,
-                        properties: {
-                            specs: {
-                                type: Type.OBJECT,
-                                properties: {
-                                    manufacturer: { type: Type.STRING, description: "Manufacturer Name if found" },
-                                    doorStyle: { type: Type.STRING, description: "Door Style Name" },
-                                    finish: { type: Type.STRING, description: "Finish/Color Name" },
-                                    construction: { type: Type.STRING, description: "Construction specs" },
-                                    notes: { type: Type.STRING, description: "Any other project notes" }
-                                }
-                            },
-                            items: {
-                                type: Type.ARRAY,
-                                items: {
-                                    type: Type.OBJECT,
-                                    properties: {
-                                        code: { type: Type.STRING, description: "The Exact Product Code (e.g. VDB27AH-3)" },
-                                        normalizedCode: { type: Type.STRING, description: "NKBA equivalent code" },
-                                        qty: { type: Type.NUMBER },
-                                        type: { type: Type.STRING, description: "Base, Wall, Tall, Filler, Panel, Accessory" },
-                                        description: { type: Type.STRING },
-                                        width: { type: Type.NUMBER },
-                                        height: { type: Type.NUMBER },
-                                        depth: { type: Type.NUMBER },
-                                        extractedPrice: { type: Type.NUMBER },
-                                        modifications: {
-                                            type: Type.ARRAY,
-                                            items: {
-                                                type: Type.OBJECT,
-                                                properties: {
-                                                    description: { type: Type.STRING, description: "e.g. Finish End Left" },
-                                                    price: { type: Type.NUMBER }
-                                                }
-                                            }
-                                        },
-                                        notes: { type: Type.STRING }
-                                    },
-                                    required: ["code", "qty", "type", "description"]
-                                }
-                            }
-                        },
-                        required: ["items", "specs"]
-                    },
-                    temperature: 0.1,
-                    maxOutputTokens: 8192, 
-                }
+                config: generationConfig
             });
-            console.log("Raw AI Response:", result.text); // Debugging
             return result;
         });
-        
-        const result = safeJSONParse(response.text || "{}");
+
+        let text = "";
+        try {
+            // Handle different SDK versions (method vs getter)
+            const r = response as any;
+            if (typeof r.text === 'function') {
+                text = r.text();
+            } else if (typeof r.text === 'string') {
+                text = r.text;
+            } else if (r.response && typeof r.response.text === 'function') {
+                text = r.response.text();
+            } else {
+                text = JSON.stringify(r); // Fallback debug
+            }
+        } catch (e) {
+            console.error("Error extracting text from AI response:", e);
+        }
+
+        console.log("AI Raw Response Length:", text.length);
+        console.log("AI Raw Response Preview:", text.substring(0, 500));
+
+        const result = safeJSONParse(text);
+
+        if (result.scratchpad) {
+            console.log("--- AI SCRATCHPAD CONTENT ---");
+            console.log(result.scratchpad);
+            console.log("-----------------------------");
+        }
         const rawItems = Array.isArray(result?.items) ? result.items : [];
         const rawSpecs = result?.specs || {};
 
@@ -364,35 +762,41 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
             // Exclude items that are JUST appliances, but keep cabinets/panels FOR appliances
             // ONLY filter if the CODE is also not a valid cabinet code
             
+            // NOTE: If description is "Cabinet", we KEEP IT regardless of code.
+            const isCabinetDescription = desc.includes("CABINET") || desc.includes("BASE") || desc.includes("WALL") || desc.includes("TALL") || desc.includes("VANITY") || desc.includes("DRAWER");
+            
             if (desc.includes("FRIDGE") || desc.includes("REFRIGERATOR")) {
-                 if (!desc.includes("PANEL") && !desc.includes("CABINET") && !desc.includes("ENCLOSURE") && !desc.includes("KIT") && !isCabinetCode) return false;
+                 if (!desc.includes("PANEL") && !desc.includes("ENCLOSURE") && !desc.includes("KIT") && !isCabinetCode && !isCabinetDescription) return false;
             }
             if (desc.includes("DISHWASHER")) {
-                 if (!desc.includes("PANEL") && !desc.includes("RETURN") && !desc.includes("CABINET") && !desc.includes("KIT") && !isCabinetCode) return false;
+                 if (!desc.includes("PANEL") && !desc.includes("RETURN") && !desc.includes("KIT") && !isCabinetCode && !isCabinetDescription) return false;
             }
             if (desc.includes("RANGE") || desc.includes("COOKTOP") || desc.includes("OVEN")) {
-                 if (!desc.includes("HOOD") && !desc.includes("CABINET") && !desc.includes("BASE") && !desc.includes("KIT") && !isCabinetCode) return false;
+                 if (!desc.includes("HOOD") && !desc.includes("KIT") && !isCabinetCode && !isCabinetDescription) return false;
             }
             // Exclude Sinks but keep Sink Bases and Accessories
             if (desc.includes("SINK")) {
-                 if (!desc.includes("BASE") && !desc.includes("CABINET") && !desc.includes("FRONT") && !desc.includes("TRAY") && !desc.includes("MAT") && !desc.includes("KIT") && !isCabinetCode) return false;
+                 if (!desc.includes("FRONT") && !desc.includes("TRAY") && !desc.includes("MAT") && !desc.includes("KIT") && !isCabinetCode && !isCabinetDescription) return false;
             }
             // Exclude Faucets
             if (desc.includes("FAUCET")) return false;
 
             // Exclude Microwaves but keep Cabinets
             if (desc.includes("MICROWAVE")) {
-                if (!desc.includes("CABINET") && !desc.includes("SHELF") && !desc.includes("BASE") && !desc.includes("KIT") && !desc.includes("HOOD") && !isCabinetCode) return false;
+                if (!desc.includes("SHELF") && !desc.includes("KIT") && !desc.includes("HOOD") && !isCabinetCode && !isCabinetDescription) return false;
             }
             
             // Allow Trash/Recycle explicitly (override other filters if needed, though they shouldn't conflict)
             if (desc.includes("TRASH") || desc.includes("WASTE") || desc.includes("RECYCLE") || desc.includes("BIN")) return true;
 
-            // Allow Interior Accessories explicitly
-            if (desc.includes("TRAY") || desc.includes("DIVIDER") || desc.includes("SPICE") || desc.includes("KNIFE") || desc.includes("CUTLERY") || desc.includes("ORGANIZER") || desc.includes("ROT") || desc.includes("SHELF") || desc.includes("INTERIOR") || desc.includes("DRAWER") || desc.includes("BUTT") || desc.includes("TD")) return true;
+            // Allow Interior Accessories explicitly (Expanded List)
+            if (desc.includes("TRAY") || desc.includes("DIVIDER") || desc.includes("SPICE") || desc.includes("KNIFE") || desc.includes("CUTLERY") || desc.includes("ORGANIZER") || desc.includes("ROT") || desc.includes("SHELF") || desc.includes("INTERIOR") || desc.includes("DRAWER") || desc.includes("BUTT") || desc.includes("TD") || desc.includes("PULL OUT") || desc.includes("HAMPER") || desc.includes("RACK") || desc.includes("LAZY") || desc.includes("SUSAN") || desc.includes("CORNER") || desc.includes("BLIND") || desc.includes("LEMANS") || desc.includes("MAGIC")) return true;
             
-            // Exclude Generic Electronics/Hardware
-            if (desc.includes("TELEVISION") || desc.includes(" TV ") || desc.includes("OUTLET") || desc.includes("SWITCH")) return false;
+            // Exclude Generic Electronics/Hardware (Expanded List)
+            if (desc.includes("TELEVISION") || desc.includes(" TV ") || desc.includes("OUTLET") || desc.includes("SWITCH") || desc.includes("DATA") || desc.includes("PHONE") || desc.includes("CABLE") || desc.includes("SPEAKER") || desc.includes("AUDIO") || desc.includes("WIRE")) return false;
+            
+            // Exclude Plumbing Accessories (Expanded List)
+            if (desc.includes("SOAP") || desc.includes("DISPENSER") || desc.includes("DRAIN") || desc.includes("STRAINER") || desc.includes("DISPOSAL") || desc.includes("AIR GAP") || desc.includes("FLANGE")) return false;
             
             if (code === "PAGE" || code.startsWith("PAGE ")) return false;
             
@@ -411,16 +815,36 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
             else if (rawType.includes('accessory') || rawType.includes('molding') || rawType.includes('kit') || rawType.includes('toe')) type = 'Accessory';
             else type = 'Base'; // Default
 
-            const originalCode = item.code || "UNKNOWN";
-            let normalizedCode = item.normalizedCode || originalCode;
-            
-            // Cleanup Code
-            normalizedCode = normalizeNKBACode(normalizedCode);
-
-            // Fallback Logic for dimensions if AI missed them
+            // Defaults logic moved up for fallback usage
             let width = typeof item.width === 'number' ? item.width : 0;
             let height = typeof item.height === 'number' ? item.height : 0;
             let depth = typeof item.depth === 'number' ? item.depth : 0;
+
+            // Cleanup Code
+            let originalCode = item.code;
+            
+            // Fallback: If AI returns UNKNOWN or null, try to construct code from dimensions
+            if (!originalCode || originalCode.toUpperCase() === 'UNKNOWN') {
+                if (width > 0) {
+                     // Refined Type Checking for Fallback
+                     const desc = (item.description || "").toLowerCase();
+                     const isDrawer = rawType.includes('drawer') || desc.includes('drawer');
+                     const isSink = rawType.includes('sink') || desc.includes('sink');
+
+                     if (type === 'Base') {
+                         if (isDrawer) originalCode = `DB${width}`;
+                         else if (isSink) originalCode = `SB${width}`;
+                         else originalCode = `B${width}`;
+                     }
+                     else if (type === 'Wall') originalCode = `W${width}${height > 0 ? height : 30}`;
+                     else if (type === 'Tall') originalCode = `U${width}${height > 0 ? height : 84}`;
+                } else {
+                    originalCode = "UNKNOWN";
+                }
+            }
+
+            let normalizedCode = item.normalizedCode || originalCode;
+            normalizedCode = normalizeNKBACode(normalizedCode);
             
             // Extract from NKBA code if 0 (e.g. W3030 -> 30W 30H)
             if (width === 0 && normalizedCode.match(/[A-Z]+(\d{2,})/)) {
@@ -465,7 +889,7 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
                 notes: (rawSpecs.notes || "") + constructionNote,
                 selectedOptions: {}
             },
-            items
+            items: consolidateItems(items)
         };
     } catch (error: any) {
         console.error("AI Generation Error Full:", JSON.stringify(error, null, 2));
@@ -518,7 +942,7 @@ export async function determineExcelStructure(sheetName: string, sampleRows: any
     try {
         const response = await callAIWithRetry(async () => {
             return await ai.models.generateContent({
-                model: FAST_MODEL_NAME,
+                model: MODEL_NAME, // Use the default Flash model
                 contents: { parts: [{ text: prompt }, { text: dataStr }] },
                 config: { 
                     responseMimeType: "application/json",
