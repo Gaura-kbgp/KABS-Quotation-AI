@@ -10,8 +10,15 @@ export const normalizeNKBACode = (rawCode: string): string => {
     code = code.replace(/€/g, 'E');
     code = code.replace(/@/g, '0');
 
-    // Aggressive Space Removal
-    code = code.replace(/\s+/g, '');
+    // Aggressive Space Removal - MODIFIED to preserve suffixes like " BUTT"
+    // We want to remove spaces inside the code (e.g. "SB 33" -> "SB33")
+    // But keep space before known text suffixes if needed?
+    // Actually, most catalogs use "SB33" or "SB33BUTT". If the catalog has "SB33 BUTT", we need to keep space.
+    // Let's normalize multiple spaces to single space first.
+    code = code.replace(/\s+/g, ' ').trim();
+    
+    // Remove space between Letters and Numbers (e.g. "SB 33" -> "SB33")
+    code = code.replace(/([A-Z])\s+(\d)/g, '$1$2');
 
     // 2. Fix "BD1 015" -> "BD15" pattern (The '1' is often a pipe '|' or noise before a zero-padded number)
     // Target specific pattern: [Letters] + 10 + [2 Digits]
@@ -25,14 +32,14 @@ export const normalizeNKBACode = (rawCode: string): string => {
 
     // 3. Handle specific Manufacturer Suffixes that are directional/cosmetic only
     code = code.replace(/-?2B$/, ''); 
-    code = code.replace(/-?BUTT$/, '');
+    // code = code.replace(/-?BUTT$/, ''); <-- DISABLED: User needs BUTT
     
     // NEW: Handle (L) or (R) in parenthesis
     code = code.replace(/\([LR]\)$/, '');
 
     // NEW: Handle "DP" (Deep) or "BUT" (Butt) inside the code like W3618 X 24 DP BUT
     code = code.replace(/\s*X\s*\d+\s*DP/g, ''); // Remove explicit depth notation e.g. " X 24 DP"
-    code = code.replace(/\s*BUTT?/g, ''); // Remove BUT or BUTT
+    // code = code.replace(/\s*BUTT?/g, ''); // Remove BUT or BUTT <-- DISABLED: User needs BUTT for SKU matching
     
     // NEW: Handle "1TD" (Tray Divider) or "ROT" (Roll Out Tray) embedded in code
     code = code.replace(/\d*TD/g, ''); // Remove "1TD", "TD"

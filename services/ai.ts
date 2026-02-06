@@ -18,12 +18,17 @@ OUTPUT: A JSON object with "scratchpad", "specs", and "items".
 
 INTELLIGENCE RULES:
 1.  **Analyze All Input**: If text is provided, read it all. If images are provided, analyze every page.
-2.  **Find Codes**: Identify cabinet codes (e.g., "B30", "W3030", "VDB27", "SB36").
-3.  **Infer Missing Codes**: If a cabinet has dimensions but no code (e.g., a 30" wide Base), construct the code "B30". Use "W{width}{height}" for walls.
-4.  **Filter Noise**: Exclude appliances (Fridge, Stove, DW) unless they are cabinet enclosures/panels. Exclude electrical/plumbing symbols.
-5.  **Grouping**: Group findings by page in the "scratchpad" field.
-6.  **Deduplicate**: If the SAME cabinet appears multiple times (e.g. Plan vs Elevation), count it ONLY ONCE.
-7.  **Text Mode**: If analyzing raw text, assume it is a Cabinet List/Quote. Extract the codes and quantities directly.
+2.  **Room Detection (CRITICAL)**: 
+    - Identify which Room/Area each item belongs to (e.g., "Kitchen", "Master Bath").
+    - If multiple Kitchens exist, number them: "Kitchen 1", "Kitchen 2".
+    - If multiple Bathrooms exist, number them: "Bath 1", "Bath 2".
+    - Assign the "room" field for EVERY item. Default to "General" if unknown.
+3.  **Find Codes**: Identify cabinet codes (e.g., "B30", "W3030", "VDB27", "SB36").
+4.  **Infer Missing Codes**: If a cabinet has dimensions but no code (e.g., a 30" wide Base), construct the code "B30". Use "W{width}{height}" for walls.
+5.  **Filter Noise**: Exclude appliances (Fridge, Stove, DW) unless they are cabinet enclosures/panels. Exclude electrical/plumbing symbols.
+6.  **Grouping**: Group findings by page in the "scratchpad" field.
+7.  **Deduplicate**: If the SAME cabinet appears multiple times (e.g. Plan vs Elevation), count it ONLY ONCE.
+8.  **Text Mode**: If analyzing raw text, assume it is a Cabinet List/Quote. Extract the codes and quantities directly.
 
 Your extraction must be exhaustive and accurate.
 `;
@@ -42,9 +47,11 @@ function consolidateItems(items: any[]): any[] {
         const d = Math.round(item.depth || 0);
         // We sort modifications to ensure order doesn't matter
         const mods = (item.modifications || []).map((m: any) => (m.description || "").trim()).sort().join('|');
+        const room = item.room || "General";
         
         // Key includes type to differentiate Base vs Wall if codes are ambiguous
-        const key = `${normCode}_${item.type}_${w}x${h}x${d}_${mods}`;
+        // ADDED ROOM TO KEY to prevent merging items across rooms!
+        const key = `${normCode}_${item.type}_${w}x${h}x${d}_${mods}_${room}`;
 
         if (map.has(key)) {
             const existing = map.get(key);
@@ -180,61 +187,261 @@ const resizeImageIfNeeded = async (file: File): Promise<string> => {
 import { convertPdfToImages, extractTextFromPdf } from "./pdfUtils";
 
 // --- NEW: Local Heuristic Extraction to Bypass AI for Simple Lists ---
+
+interface RoomContext {
+    currentRoom: string;
+    counts: { [key: string]: number };
+    lastKitchenRoom: string | null;
+}
+
 function tryLocalRegexExtraction(text: string): CabinetItem[] {
     const items: CabinetItem[] = [];
-    const seenCodes = new Set<string>(); // avoid duplicates on same line
     
-    // Pattern 1: Standard Cabinet Code (e.g. B30, W3030, VDB27AH-3)
-    // Needs to be fairly strict to avoid matching random text
-    // Matches: Start of word, [A-Z]{1,4} prefix, \d{2,} dimensions, optional suffix
-    const codeRegex = /\b([A-Z]{1,4}\d{2,}[A-Z0-9-]*)\b/g;
+    // Context to track rooms across pages/chunks
+    const context: RoomContext = {
+        currentRoom: "General",
+        counts: { kitchen: 0, bath: 0 },
+        lastKitchenRoom: null
+    };
     
-    // Pattern 2: Tabular Quantity detection (Number at start of line or near code)
-    // This is hard to do perfectly with regex, so we'll look for lines that have a code
+    // Updated Regex to allow:
+    // 1. Standard Code: B30, W3030
+    // 2. Space + Suffix: SB33 BUTT, W3030 L
+    // 3. Modifiers: BUTT, L, R, 2B, etc.
+    // It captures: [CodePart] (Space [SuffixPart])*
+    // We limit suffixes to uppercase letters/digits/dashes to avoid capturing descriptions.
+    // Broader regex to catch more valid codes
+    const codeRegex = /\b([A-Z]{1,4}\d{2,}(?:[ -][A-Z0-9]+)*)\b/g;
     
-    const lines = text.split('\n');
+    // Split by page markers first to assign rooms
+    // extractTextFromPdf adds "\n--- PAGE X ---\n"
+    const pages = text.split(/--- PAGE (\d+) ---/);
+    
+    // pages[0] is usually empty or pre-text. 
+    // Then we get [pageNum, pageContent, pageNum, pageContent...]
+    
+    let currentPageNum = "1";
+    
+    // If text was split by page markers, iterate through pages
+    if (pages.length > 1) {
+        for (let i = 1; i < pages.length; i += 2) {
+             currentPageNum = pages[i];
+             const pageContent = pages[i+1];
+             if (!pageContent) continue;
+             
+             extractFromChunk(pageContent, items, currentPageNum, context);
+        }
+    } else {
+        // Fallback for single chunk
+        extractFromChunk(text, items, "1", context);
+    }
+    
+    return items;
+}
+
+function extractFromChunk(chunk: string, items: CabinetItem[], pageNum: string, context: RoomContext) {
+    // UPDATED REGEX:
+    // 1. Letters (A-Z): 1-5 chars (e.g. B, VSB, TOUCH)
+    // 2. Digits: 1 or more (e.g. 8 in BTK8, 30 in B30)
+    // 3. Optional attached suffix: Letters only (e.g. H in VSB3634H, L in B30L)
+    // 4. Separator + Suffixes: Space or dash, followed by alphanumeric (e.g. " BUTT", " 2B", " 2X4X96")
+    const codeRegex = /\b([A-Z]{1,5}\d{1,}[A-Z]*(?:[\s-][A-Z0-9\/]+)*)\b/g;
+
+    const lines = chunk.split('\n');
     
     for (const line of lines) {
-        // Skip obvious junk lines
-        if (line.length < 5) continue;
+        if (line.length < 4) continue;
         if (line.includes('Page') && line.includes('of')) continue;
+        
+        // --- Room Detection Logic ---
+        // Heuristic: Short line, contains Room Keyword, NO codes, NO ignored words
+        const lower = line.toLowerCase();
+        
+        // Allow "Standard" and "Opt" (Optional) to be part of headers
+        const isExplicitHeader = /^(standard|opt|optional)\b/i.test(line);
+
+        // Check for Room Header BEFORE checking for codes
+        // Some PDFs have "Kitchen: B30" on same line.
+        // But headers like "Standard 42 Kitchen" should be caught.
+
+        // Stricter Length Limit for Headers (was 60)
+        let potentialHeader = line;
+        let isSameLineHeader = false;
+        
+        // ... (Keep existing header logic, just skip if line looks like pure code list unless it starts with Room:) ...
+        
+        const hasCode = codeRegex.test(line);
+        if (hasCode) {
+            // Check if the line STARTS with a room name followed by a colon or space
+            const match = line.match(/^((?:Standard|Opt|Optional|Kitchen|Bath|Master|Utility|Laundry|Room|Area|Owners)[^:]*?)(?::|\s{2,}|(?=\s[A-Z0-9]))/i);
+            if (match) {
+                potentialHeader = match[1];
+                if (potentialHeader.length < 50) { // Increased length for "Standard Owners Bath"
+                     isSameLineHeader = true;
+                }
+            }
+        }
+
+        if ((!hasCode || isSameLineHeader) && potentialHeader.length < 50) {
+            
+            // 1. Explicit "Room:" prefix support
+            const roomPrefixMatch = potentialHeader.match(/^(?:room|area|location)\s*[:\-#]?\s*(.+)/i);
+            if (roomPrefixMatch) {
+                let rName = roomPrefixMatch[1].trim();
+                // Clean up weird chars
+                rName = rName.replace(/[:\-]/g, '').trim();
+                if (rName.length > 2 && rName.length < 25) {
+                    context.currentRoom = rName; // Trust explicit headers
+                    if (!isSameLineHeader) continue;
+                }
+            }
+
+            // 2. Keyword Search with Word Boundaries (\b) to avoid partial matches
+            const lowerHeader = potentialHeader.toLowerCase();
+            const isKitchen = /\bkitchen\b/i.test(potentialHeader);
+            const isBath = /\b(bath|bathroom|vanity|ensuite|powder|restroom|owners)\b/i.test(potentialHeader);
+            const isLaundry = /\b(laundry|utility|mud)\b/i.test(potentialHeader);
+            const isIsland = /\b(island)\b/i.test(potentialHeader);
+            const isOther = /\b(master|living|dining|pantry|bar)\b/i.test(potentialHeader);
+            
+            // Words that suggest this is NOT a header but a description
+            // REMOVED: "option" (conflict with OPT header), "style" (conflict with Standard Style?)
+            const ignoredWords = [
+                'cabinet', 'base', 'wall', 'tall', 'filler', 'molding', 'toe', 'kick', 
+                'panel', 'door', 'drawer', 'hinge', 'slide', 'accessory', 'hardware', 
+                'touch', 'kit', 'install', 'glaze', 'paint', 'stain', 'finish', 
+                'upgrade', 'style', 'color', 'spec', 'note', 'adjacent', 
+                'chute', 'basket', 'hamper', 'sink', 'faucet', 'counter', 'top'
+            ];
+            
+            // Special Check: "Perimeter" usually implies we are inside a Kitchen, not a new room.
+            const isPerimeter = /\bperimeter\b/i.test(potentialHeader);
+            
+            let hasIgnored = ignoredWords.some(w => lowerHeader.includes(w));
+            
+            // If it starts with "Standard" or "Opt", we might be stricter about what we ignore
+            if (isExplicitHeader) {
+                hasIgnored = false; 
+            }
+
+            if ((isKitchen || isBath || isLaundry || isIsland || isOther || isPerimeter) && !hasIgnored) {
+                // Ensure it's not just a random word in a sentence
+                const wordCount = potentialHeader.split(/\s+/).length;
+                if (wordCount > 6 && !isExplicitHeader) { 
+                    if (!isSameLineHeader) continue;
+                } 
+
+                // --- SMART NAME EXTRACTION ---
+                let detectedName = potentialHeader.trim();
+                detectedName = detectedName.replace(/[:\-]+$/, '').trim();
+                detectedName = detectedName.replace(/^\d+[\.\)]\s*/, '');
+                
+                // Fix Casing
+                detectedName = detectedName.replace(/\w\S*/g, (w) => (w.replace(/^\w/, (c) => c.toUpperCase())));
+                
+                const hasNumber = /\d/.test(detectedName);
+                
+                if (isPerimeter) {
+                    if (context.lastKitchenRoom) {
+                         context.currentRoom = context.lastKitchenRoom;
+                    }
+                } else if (isKitchen) {
+                    if (hasNumber || detectedName.length > "Kitchen".length + 2) {
+                         context.currentRoom = detectedName;
+                    } else {
+                         context.counts.kitchen++;
+                         context.currentRoom = `Kitchen ${context.counts.kitchen}`;
+                    }
+                    context.lastKitchenRoom = context.currentRoom;
+                } else if (isIsland) {
+                    if (context.lastKitchenRoom) {
+                        context.currentRoom = context.lastKitchenRoom;
+                    } else {
+                        context.counts.kitchen = 1;
+                        context.currentRoom = "Kitchen 1";
+                        context.lastKitchenRoom = "Kitchen 1";
+                    }
+                } else if (isBath) {
+                    if (hasNumber || detectedName.length > "Bath".length + 4) {
+                         context.currentRoom = detectedName;
+                    } else {
+                         context.counts.bath++;
+                         context.currentRoom = `Bath ${context.counts.bath}`;
+                    }
+                } else if (isLaundry) {
+                     context.currentRoom = detectedName.length > 3 ? detectedName : "Laundry";
+                } else {
+                    if (detectedName.length > 25) detectedName = "Other Room";
+                    context.currentRoom = detectedName;
+                }
+                
+                if (!isSameLineHeader) continue; 
+            }
+        }
         
         const matches = [...line.matchAll(codeRegex)];
         if (matches.length === 0) continue;
         
-        // Find quantity if possible (look for number before the code)
+        // Find quantity
         let qty = 1;
-        const qtyMatch = line.match(/^(\d+)\s+/); // Number at start of line
+        // Updated Quantity Regex to handle "1-BTK8", "1 - BTK8", "3 BTK8", "3- BTK8"
+        // Look for digit(s) at start of line, optionally followed by dash/space
+        const qtyMatch = line.match(/^(\d+)\s*[-\s]\s*/); 
         if (qtyMatch) {
             qty = parseInt(qtyMatch[1], 10);
-            if (qty > 100 || qty < 1) qty = 1; // Safety
+            if (qty > 100 || qty < 1) qty = 1; 
         }
         
         for (const match of matches) {
             const code = match[1];
-            // Filter invalid codes (like dates, years, phone numbers)
             if (code.match(/^\d{4}/)) continue; // Year like 2024
-            if (code.length > 20) continue; // Too long
-            
+            if (code.length > 30) continue; // Safety limit
+            if (code.includes("PHONE") || code.includes("FAX")) continue;
+            if (["PAGE", "ITEM", "NOTE", "DATE", "TIME", "TOTAL", "SUBTOTAL"].includes(code)) continue;
+
             // Basic Type Inference
             let type: CabinetType = 'Base';
             if (code.startsWith('W')) type = 'Wall';
-            else if (code.startsWith('T') || code.startsWith('U')) type = 'Tall';
-            else if (code.startsWith('V')) type = 'Accessory'; // Vanity or Valance
+            else if (code.startsWith('T') || code.startsWith('U') || code.startsWith('O')) type = 'Tall';
+            else if (code.startsWith('V') || code.startsWith('B') && code.includes('VAN')) type = 'Accessory'; // Vanities?
+            else if (code.startsWith('D') && !code.startsWith('DB')) type = 'Accessory'; // Drawer fronts?
             
+            // --- EXTRACT DESCRIPTION ---
+            // Get text AFTER the code match on the same line
+            // match.index is where code starts. match[0].length is code length.
+            let description = "";
+            if (match.index !== undefined) {
+                const afterCode = line.substring(match.index + match[0].length).trim();
+                if (afterCode.length > 2) {
+                    description = afterCode;
+                    // Remove Price at end (e.g. $1,234.00 or 1,234.00)
+                    description = description.replace(/[\$]?[\d,]+\.\d{2}$/, '').trim();
+                    // Remove leading hyphens/separators
+                    description = description.replace(/^[-–—]\s*/, '').trim();
+                }
+            }
+            
+            // If still empty or just garbage, generate a smart description based on code
+            if (!description || description.length < 3) {
+                if (type === 'Base') description = `Base Cabinet ${code.match(/\d+/)?.[0] || ""}"`;
+                else if (type === 'Wall') description = `Wall Cabinet ${code.match(/\d+/)?.[0] || ""}"`;
+                else if (type === 'Tall') description = `Tall Cabinet ${code.match(/\d+/)?.[0] || ""}"`;
+                else if (type === 'Accessory') description = `Accessory/Part ${code}`;
+                else description = "Cabinet Item";
+            }
+
             items.push({
-                id: `local_${Date.now()}_${items.length}`,
+                id: `local_${Date.now()}_${items.length}_${Math.random().toString(36).substr(2,5)}`,
                 originalCode: code,
                 quantity: qty,
                 type: type,
-                description: "Fast Scan Item", // Placeholder
+                description: description, 
                 width: 0, height: 0, depth: 0,
-                normalizedCode: code
+                normalizedCode: code,
+                room: context.currentRoom // Use the detected room
             });
         }
     }
-    
-    return items;
 }
 
 export async function extractManufacturerSpecs(file: File): Promise<any> {
@@ -327,10 +534,11 @@ export async function extractManufacturerSpecs(file: File): Promise<any> {
  ======================== 
  WHAT TO EXTRACT FROM PDF 
  ======================== 
- From the specification guide, identify and group: 
+ From the specification guide (especially Table of Contents or Index pages), identify and group: 
  
- 1. Door Style 
-    - Series (Elite / Premium / Prime / Choice) 
+ 1. Door Style (Hierarchy: Collection/Series -> Door Style)
+    - Look for Collections (e.g. "Elite", "Premium", "Classic").
+    - "Elite" data is High Priority if present.
     - Door Style Name (Canyon, Durango, Abilene, etc.) 
     - Overlay type (Full Overlay / Partial Overlay) 
     - Panel type (Slab / Recessed / Raised / Mitered) 
@@ -372,6 +580,8 @@ export async function extractManufacturerSpecs(file: File): Promise<any> {
  ======================== 
  STRICT RULES 
  ======================== 
+ • Check the Table of Contents/Index first to find Collection names.
+ • If "Elite" collection exists, make sure to extract its specific options.
  • DO NOT guess 
  • DO NOT hallucinate options not found in PDF 
  • DO NOT merge incompatible finishes or door styles 
@@ -388,11 +598,17 @@ export async function extractManufacturerSpecs(file: File): Promise<any> {
    "manufacturer": "Name Detected from PDF", 
    "specificationSections": [ 
      { 
-       "section": "Door Style", 
+       "section": "Collection", 
        "type": "select", 
+       "options": ["Elite", "Premium", "Standard"] 
+     },
+     { 
+       "section": "Door Style", 
+       "type": "dependent-select", 
+       "dependsOn": "Collection",
        "options": [ 
          { 
-           "series": "Elite", 
+           "collection": "Elite", 
            "name": "Canyon", 
            "overlay": "Full Overlay", 
            "panel": "Recessed", 
@@ -500,7 +716,9 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
              
              // --- INSTANT LOCAL EXTRACTION (BYPASS AI) ---
              const localItems = tryLocalRegexExtraction(rawText);
-             if (localItems.length >= 5) {
+             // LOWERED THRESHOLD: If we find even ONE valid item via regex, trust it and return immediately.
+             // This is the "Fast Scan" promise.
+             if (localItems.length >= 1) {
                  console.log(`INSTANT SCAN SUCCESS: Found ${localItems.length} items using local regex. Bypassing AI.`);
                  // Return immediately with locally found items
                  return {
@@ -563,10 +781,9 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
 
                 console.log(`Successfully converted ${pdfImages.length} PDF pages to images.`);
 
-                // OPTIMIZATION: If too many pages (>20), fallback to text-only mode for the remaining pages or warn user
-                // Or better: Only send the first 20 pages as images, and the rest as text if possible?
-                // For now, let's limit to 15 images to prevent timeouts
-                const MAX_IMAGES = 15;
+                // OPTIMIZATION: If too many pages (>50), fallback to text-only mode for the remaining pages or warn user
+                // User requested FULL SCAN of large docs, so we increased limit from 15 to 50.
+                const MAX_IMAGES = 50;
                 const imagesToProcess = pdfImages.slice(0, MAX_IMAGES);
 
                 contentsParts.push({ text: `*** DOCUMENT INFO: This PDF contains ${pdfImages.length} pages. 
@@ -682,6 +899,7 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
                             properties: {
                                 code: { type: "STRING", description: "Exact Product Code (e.g. VDB27AH-3). IF TEXT IS MISSING, CONSTRUCT NKBA CODE (e.g. B15, W3030) FROM DIMS. NEVER RETURN 'UNKNOWN'." },
                                 normalizedCode: { type: "STRING", description: "NKBA equivalent code" },
+                                room: { type: "STRING", description: "The room/area this item belongs to (e.g. Kitchen 1, Bath 2, Laundry)" },
                                 qty: { type: "NUMBER" },
                                 type: { type: "STRING", description: "Base, Wall, Tall, Filler, Panel, Accessory" },
                                 description: { type: "STRING" },
@@ -872,6 +1090,7 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
                 height: height,
                 depth: depth,
                 quantity: typeof item.qty === 'number' ? item.qty : 1,
+                room: item.room || "General",
                 notes: item.notes || "",
                 extractedPrice: item.extractedPrice || undefined,
                 modifications: Array.isArray(item.modifications) ? item.modifications : []

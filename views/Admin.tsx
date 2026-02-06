@@ -468,106 +468,202 @@ export const Admin: React.FC = () => {
                     const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" }) as any[][];
                     if (!rows || rows.length < 2) continue; 
 
-                    // Determine structure (lightweight AI call or heuristic)
-                    let structure: any = { skuColumn: null, priceColumns: [], optionTableType: null };
+                    // --- ADVANCED STRUCTURE DETECTION (UPDATED) ---
+                    // Supports:
+                    // 1. "Black Box" Collection Headers (Row 0/1) with Merge Filling
+                    // 2. Vertical Text Door Styles (SKU Row)
+                    // 3. Multi-style columns (Split by newline/slash)
+
+                    // Step 1: Find SKU Row
+                    let skuRowIndex = -1;
+                    let skuColIndex = -1;
                     
-                    // Use Heuristics FIRST to save time
-                    const headerRowIdx = rows.findIndex(r => r.some((c:any) => 
-                        String(c).match(/sku|item|product|code|model|part|cabinet|number|no\.|key|nomenclature|style/i)
-                    ));
-                    
-                    if (headerRowIdx !== -1) {
-                         const headerRow = rows[headerRowIdx].map(String);
-                         structure.skuColumn = headerRow.findIndex(c => c.match(/sku|item|product|code|model|part|cabinet|number|no\.|key|nomenclature|style/i));
-                         
-                         // Find price columns
-                         headerRow.forEach((h, idx) => {
-                             // Enhanced Price Detection
-                             if ((h.match(/price|cost|list|msrp|amount|rate|net|retail|unit/i) || h.includes('$')) && !h.match(/code|sku|model|part|page|width|height|depth/i)) {
-                                 structure.priceColumns.push({ index: idx, name: h });
-                             }
-                         });
+                    for (let r = 0; r < Math.min(rows.length, 20); r++) {
+                        const rowStr = rows[r].map(c => String(c).trim()).join(' ').toLowerCase();
+                        if (rowStr.match(/sku|item|model|part|code|nomenclature/i)) {
+                            const idx = rows[r].findIndex((c:any) => String(c).match(/sku|item|model|part|code|nomenclature/i));
+                            if (idx !== -1) {
+                                skuRowIndex = r;
+                                skuColIndex = idx;
+                                break;
+                            }
+                        }
                     }
 
-                    // Fallback: If no header row found but we have data, try Column 0 as SKU if it looks valid
-                    if (structure.skuColumn === null && rows.length > 5) {
-                        // Check if Column 0 has SKU-like data (short alphanumeric strings)
-                        const col0Samples = rows.slice(1, 10).map(r => String(r[0] || ""));
-                        const isSkuLike = col0Samples.every(s => s.length > 2 && s.length < 20 && /[A-Z0-9]/.test(s));
+                    if (skuRowIndex === -1) continue; // Skip sheet if no SKU row found
+
+                    // Step 2: Map Columns to Collection & Door Styles
+                    // Logic: Look at rows ABOVE skuRowIndex for Collection
+                    // Look at skuRowIndex (Vertical Text) for Door Styles
+                    
+                    const columnMap: Record<number, { collection: string, styles: string[] }> = {};
+                    let lastCollection = "Standard";
+
+                    const headerRow = rows[skuRowIndex];
+                    
+                    // Iterate columns starting after SKU
+                    for (let c = skuColIndex + 1; c < headerRow.length; c++) {
+                        // A. Find Collection (Look upwards from SKU row)
+                        // Heuristic: Scan rows 0 to skuRowIndex-1. 
+                        // If a value exists in this column, update lastCollection.
+                        // If empty, use lastCollection (Fill Forward).
+                        let foundCollectionInCol = false;
+                        for (let r = 0; r < skuRowIndex; r++) {
+                            const cellVal = String(rows[r][c] || "").trim();
+                            if (cellVal && cellVal.length > 2 && !cellVal.match(/price|cost|page|option|spec|feature|construction|description|note|width|height|depth|qty/i)) {
+                                lastCollection = cellVal; // Found a new collection block
+                                foundCollectionInCol = true;
+                                break; // Use the top-most non-empty value? Or bottom-most? 
+                                       // Usually "Black Box" is top-most.
+                            }
+                        }
+                        // If no value found in this column, we assume it belongs to the previous 'lastCollection' (Merge behavior)
                         
-                        if (isSkuLike) {
-                            structure.skuColumn = 0;
-                            console.log(`Fallback: Assuming Column A is SKU for sheet ${sheetName}`);
-                            
-                            // Look for first price-like column
-                            // Check first 10 rows for a column that has $ or is numeric
-                            const potentialPriceCols: number[] = [];
-                            // Check columns 1 to 10
-                            for (let c = 1; c < Math.min(rows[0].length, 10); c++) {
-                                 const colSamples = rows.slice(1, 10).map(r => r[c]);
-                                 const isNumeric = colSamples.every(v => {
-                                     if (!v) return true; // Ignore empty
-                                     const s = String(v).replace(/[$,]/g, '');
-                                     return !isNaN(parseFloat(s));
-                                 });
-                                 if (isNumeric) potentialPriceCols.push(c);
-                            }
-                            
-                            if (potentialPriceCols.length > 0) {
-                                // Take the last one (often List Price is last) or first one? 
-                                // Usually List Price is early. Let's take all.
-                                potentialPriceCols.forEach(idx => {
-                                    structure.priceColumns.push({ index: idx, name: `Column ${String.fromCharCode(65+idx)}` });
-                                });
-                            }
+                        // B. Find Door Styles (Vertical Text in SKU Row)
+                        const styleCell = String(headerRow[c] || "").trim();
+                        if (!styleCell || styleCell.match(/width|height|depth|qty|page|desc|note/i)) continue;
+
+                        // Split by Newline or Slash for multi-style columns
+                        // e.g. "Abilene Cherry\nBelcourt Cherry"
+                        const styles = styleCell.split(/[\n\/]/).map(s => s.trim()).filter(s => s.length > 0);
+                        
+                        if (styles.length > 0) {
+                            columnMap[c] = {
+                                collection: lastCollection,
+                                styles: styles
+                            };
                         }
                     }
 
-                    // Fallback to AI if heuristics fail
-                    if (structure.skuColumn === null || structure.priceColumns.length === 0) {
-                             if (rows.length > 200) {
-                                 const sample = [
-                                     ...rows.slice(0, 20),
-                                     ...rows.slice(Math.floor(rows.length/2), Math.floor(rows.length/2) + 20)
-                                 ];
-                                 structure = await determineExcelStructure(sheetName, sample);
-                             } else {
-                                 structure = await determineExcelStructure(sheetName, rows);
-                             }
-                        }
+                    // Step 3: Process Data Rows
+                    for (let r = skuRowIndex + 1; r < rows.length; r++) {
+                        const row = rows[r];
+                        if (!row[skuColIndex]) continue;
 
-                        if (structure.skuColumn !== null && structure.priceColumns.length > 0) {
-                            const skuCol = structure.skuColumn;
-                            
-                            // Process Rows
-                            rows.slice(headerRowIdx + 1).forEach(row => {
-                                const rawVal = String(row[skuCol] || "").trim();
-                                if (!rawVal || rawVal.length < 2 || rawVal.match(/^page/i)) return;
+                        const rawSku = String(row[skuColIndex]);
+                        if (rawSku.match(/sku|item|page|total/i) || rawSku.length < 2) continue;
 
-                                // Normalize SKU Key for consistent lookup
-                                const cleanSku = normalizeImportSku(rawVal);
-                                if (!cleanSku) return;
+                        const cleanSku = normalizeImportSku(rawSku);
+                        if (!cleanSku) continue;
 
-                                if (!updatedCatalog[cleanSku]) updatedCatalog[cleanSku] = {};
+                        if (!updatedCatalog[cleanSku]) updatedCatalog[cleanSku] = {};
 
-                                structure.priceColumns.forEach((pc: any) => {
-                                    const priceVal = parseFloat(String(row[pc.index]).replace(/[^0-9.]/g, ''));
-                                    if (!isNaN(priceVal) && priceVal > 0) {
-                                        // If sheet has a specific Door Style (e.g. "Ashland"), prefix it
-                                        const stylePrefix = structure.doorStyleName ? `${structure.doorStyleName} - ` : "";
-                                        const fullTierName = stylePrefix + pc.name;
-                                        updatedCatalog[cleanSku][fullTierName] = priceVal;
-                                        foundPriceHeaders.add(fullTierName);
-                                    }
+                        let rowHasPrice = false;
+
+                        // Iterate mapped columns
+                        Object.keys(columnMap).forEach(colIdxStr => {
+                            const colIdx = parseInt(colIdxStr);
+                            const rawPrice = row[colIdx];
+                            if (!rawPrice) return;
+
+                            const price = parseFloat(String(rawPrice).replace(/[^0-9.]/g, ''));
+                            if (!isNaN(price) && price > 0) {
+                                rowHasPrice = true;
+                                const mapping = columnMap[colIdx];
+                                
+                                // Create entries for ALL styles in this column
+                                mapping.styles.forEach(style => {
+                                    const tierName = mapping.collection !== "Standard"
+                                        ? `${mapping.collection} - ${style}`
+                                        : style;
+                                    
+                                    updatedCatalog[cleanSku][tierName] = price;
+                                    foundPriceHeaders.add(tierName);
                                 });
-                                parsedCount++;
-                            });
-                        }
+                            }
+                        });
+                        
+                        if (rowHasPrice) parsedCount++;
+                    }
+
+                    // Fallback: If advanced parsing failed (parsedCount == 0), try Simple List Detection
+                    if (parsedCount === 0) {
+                         // Simple List Strategy:
+                         // Look for rows that have SKU (Col A or similar) and Price (Col B or similar)
+                         // But skip header rows.
+                         
+                         let simpleSkuCol = -1;
+                         let simplePriceCol = -1;
+                         let startRow = -1;
+
+                         // Scan for headers first
+                         for(let r=0; r<Math.min(rows.length, 20); r++) {
+                             const rowStr = rows[r].map(c => String(c).trim().toLowerCase()).join(' ');
+                             if (rowStr.match(/sku|item|code|model|part/)) {
+                                 simpleSkuCol = rows[r].findIndex(c => String(c).match(/sku|item|code|model|part/i));
+                                 // Look for price in same row
+                                 simplePriceCol = rows[r].findIndex(c => String(c).match(/price|list|msrp|cost/i));
+                                 if (simpleSkuCol !== -1) {
+                                     startRow = r + 1;
+                                     break;
+                                 }
+                             }
+                         }
+
+                         // If no headers found, assume Col 0 = SKU, Col 1 = Price (if numeric)
+                         if (simpleSkuCol === -1) {
+                             // Heuristic check on row 5 (random data row)
+                             if (rows.length > 5) {
+                                 const r5 = rows[5];
+                                 if (r5[0] && String(r5[0]).length > 2 && !String(r5[1]).match(/[a-z]/i) && parseFloat(String(r5[1])) > 0) {
+                                     simpleSkuCol = 0;
+                                     simplePriceCol = 1;
+                                     startRow = 1;
+                                 }
+                             }
+                         }
+                         
+                         // If we found columns, parse simple list
+                         if (simpleSkuCol !== -1) {
+                             for (let r = startRow; r < rows.length; r++) {
+                                 const row = rows[r];
+                                 if (!row) continue;
+                                 const rawSku = String(row[simpleSkuCol] || "");
+                                 if (!rawSku || rawSku.length < 2 || rawSku.match(/sku|item|page/i)) continue;
+                                 
+                                 // Find price
+                                 let price = 0;
+                                 if (simplePriceCol !== -1) {
+                                     price = parseFloat(String(row[simplePriceCol]).replace(/[^0-9.]/g, ''));
+                                 } else {
+                                     // Scan for first numeric column
+                                     for (let c = simpleSkuCol + 1; c < row.length; c++) {
+                                         const val = parseFloat(String(row[c]).replace(/[^0-9.]/g, ''));
+                                         if (!isNaN(val) && val > 0) {
+                                             price = val;
+                                             break;
+                                         }
+                                     }
+                                 }
+
+                                 if (price > 0) {
+                                     const cleanSku = normalizeImportSku(rawSku);
+                                     if (!cleanSku) continue;
+                                     
+                                     if (!updatedCatalog[cleanSku]) updatedCatalog[cleanSku] = {};
+                                     // Use Sheet Name as Tier Name for these simple lists
+                                     // e.g. "Accessories" sheet -> Tier "Accessories"
+                                     const tierName = sheetName.trim();
+                                     updatedCatalog[cleanSku][tierName] = price;
+                                     foundPriceHeaders.add(tierName);
+                                     parsedCount++;
+                                 }
+                             }
+                         }
+                    }
 
                     if (parsedCount > 0) {
-                        const newTiers: PricingTier[] = Array.from(foundPriceHeaders).map(header => ({
-                            id: header, name: header, multiplier: 1.0
-                        }));
+                        const newTiers: PricingTier[] = Array.from(foundPriceHeaders).map(header => {
+                            // Extract Collection for Metadata
+                            const parts = header.split(' - ');
+                            const collection = parts.length > 1 ? parts[0] : undefined;
+                            return {
+                                id: header, 
+                                name: header, 
+                                multiplier: 1.0,
+                                collection: collection
+                            };
+                        });
                         newTiers.forEach(nt => {
                             if (!updatedTiers.find(t => t.name === nt.name)) updatedTiers.push(nt);
                         });
@@ -897,25 +993,6 @@ export const Admin: React.FC = () => {
                         </div>
                     ))}
                     {(!managingMfg.files?.some(f => f.type === 'spec')) && <p className="text-sm text-slate-400 italic">No spec books uploaded.</p>}
-                 </div>
-              </section>
-
-              {/* Options Discovery Audit */}
-              <section>
-                 <h4 className="font-semibold text-slate-800 mb-2 mt-6">Discovered Options ({managingMfg.options?.length || 0})</h4>
-                 <div className="max-h-60 overflow-y-auto border border-slate-200 rounded p-2 text-xs space-y-1">
-                     {managingMfg.options?.map(o => (
-                         <div key={o.id} className="flex justify-between items-center bg-slate-50 p-1 rounded">
-                             <div className="flex flex-col">
-                                 <span className="font-medium">{o.name}</span>
-                                 <span className="text-slate-400 text-[10px]">{o.category} • {o.section}</span>
-                             </div>
-                             <span className="font-mono text-slate-500">
-                                 {o.pricingType === 'percentage' ? `${(o.price*100).toFixed(1)}%` : `+$${o.price}`}
-                             </span>
-                         </div>
-                     ))}
-                     {(!managingMfg.options || managingMfg.options.length === 0) && <p className="text-slate-400">No options discovered yet.</p>}
                  </div>
               </section>
             </div>

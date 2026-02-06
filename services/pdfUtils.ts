@@ -54,11 +54,11 @@ export async function extractTextFromPdf(file: File): Promise<string> {
                 try {
                     const page = await pdf.getPage(pageNum);
                     const textContent = await page.getTextContent();
-                    // Preserve some layout by joining with space, but also consider vertical position?
-                    // For now, simple join is fast and usually sufficient for LLMs
+                    // Preserve layout by joining with newline instead of space
+                    // This prevents footers like "Page 1 of 10" from merging with content and causing the whole page to be skipped
                     const pageText = textContent.items
                         .map((item: any) => item.str)
-                        .join(' ');
+                        .join('\n');
                     return { pageNum, text: pageText };
                 } catch (pageErr) {
                     console.warn(`Failed to extract text from page ${pageNum}`, pageErr);

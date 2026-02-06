@@ -18,6 +18,7 @@ export interface CabinetItem {
   depth: number;
   quantity: number;
   notes?: string;
+  room?: string; // NEW: Room Name (e.g. "Kitchen", "Master Bath")
   extractedPrice?: number; // Price found in the PDF/Image
   modifications?: CabinetModification[]; // Add-ons like Skins, Depth changes
 }
@@ -26,6 +27,7 @@ export interface PricingTier {
   id: string;
   name: string; // Maps to Excel Column Headers (e.g. "Oak", "Painted", "Lvl 1")
   multiplier: number; 
+  collection?: string; // NEW: Grouping (e.g. "Elite", "Premium")
 }
 
 // LOGICAL WORKBOOK SECTIONS
@@ -48,12 +50,13 @@ export type WorkbookSection =
 export interface ManufacturerOption {
   id: string;
   name: string;
-  category: 'Series' | 'Door' | 'DoorStyle' | 'Finish' | 'Drawer' | 'Hinge' | 'Construction' | 'PrintedEnd' | 'Upgrade' | 'Other';
+  category: 'Collection' | 'Series' | 'Door' | 'DoorStyle' | 'Wood' | 'Finish' | 'Glaze' | 'Paint' | 'Stain' | 'Drawer' | 'Hinge' | 'Construction' | 'PrintedEnd' | 'Molding' | 'Accents' | 'Decorative' | 'Upgrade' | 'Other';
   section: WorkbookSection; // Audit trail for where this option was found
   pricingType: 'fixed' | 'percentage' | 'included';
   price: number; // Dollar amount or Decimal percentage (0.10 for 10%)
   description?: string;
   sourceSheet?: string; 
+  collection?: string; // NEW: Parent Collection (e.g. "Elite", "Premium")
   availability?: string; // "Yes", "No", or specific wood types like "Maple"
 }
 

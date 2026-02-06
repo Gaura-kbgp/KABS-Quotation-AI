@@ -96,6 +96,7 @@ export const QuotationFlow: React.FC = () => {
   const [selectedDealer, setSelectedDealer] = useState<string | null>(null); // NEW: Dealer Filter
   const [uploadError, setUploadError] = useState<string>('');
   const [isConnecting, setIsConnecting] = useState<string | null>(null);
+  const [catalogCategoryFilter, setCatalogCategoryFilter] = useState<string>(''); // NEW: Catalog Filter
 
   // Financial State Local (synced with project)
   const [financials, setFinancials] = useState<ProjectFinancials>({
@@ -180,17 +181,21 @@ export const QuotationFlow: React.FC = () => {
       updateProject({ items: newItems, pricing: newPricing });
   };
 
-  const addBOMItem = () => {
+  const addBOMItem = (initialSku?: string, targetRoom?: string) => {
       if (!project) return;
       
+      const code = typeof initialSku === 'string' ? initialSku : 'NEW';
+      const desc = typeof initialSku === 'string' ? 'Added from Catalog' : 'Manual Entry';
+
       const newItem: PricingLineItem = {
           id: crypto.randomUUID(),
-          originalCode: 'NEW',
-          normalizedCode: 'NEW',
-          description: 'Manual Entry',
+          originalCode: code,
+          normalizedCode: code,
+          description: desc,
           quantity: 1,
           width: 0, height: 0, depth: 0,
           type: 'Base',
+          room: targetRoom || 'General',
           
           // Pricing fields
           basePrice: 0,
@@ -284,21 +289,68 @@ export const QuotationFlow: React.FC = () => {
   };
 
   const getGroupedItems = <T extends CabinetItem>(items: T[]) => {
-    const groups: Record<string, T[]> = {};
-    const standardOrder: CabinetType[] = ['Base', 'Wall', 'Tall', 'Filler', 'Panel', 'Accessory', 'Modification'];
+    // Group by Room first
+    const roomGroups: Record<string, T[]> = {};
     items.forEach(item => {
-      let t = item.type || 'Base';
-      if (!standardOrder.includes(t)) t = 'Accessory';
-      if (!groups[t]) groups[t] = [];
-      groups[t].push(item);
+        const room = item.room || "General";
+        if (!roomGroups[room]) roomGroups[room] = [];
+        roomGroups[room].push(item);
     });
-    return standardOrder
-      .filter(type => groups[type] && groups[type].length > 0)
-      .map(type => ({
-        type,
-        items: groups[type],
-        totalQty: groups[type].reduce((sum, i) => sum + i.quantity, 0)
-      }));
+
+    // Then group by Type within each Room
+    const standardOrder: CabinetType[] = ['Base', 'Wall', 'Tall', 'Filler', 'Panel', 'Accessory', 'Modification'];
+    
+    return Object.keys(roomGroups).sort().map(room => {
+        const roomItems = roomGroups[room];
+        const typeGroups: Record<string, T[]> = {};
+        
+        roomItems.forEach(item => {
+            let t = item.type || 'Base';
+            if (!standardOrder.includes(t)) t = 'Accessory';
+            if (!typeGroups[t]) typeGroups[t] = [];
+            typeGroups[t].push(item);
+        });
+        
+        const categories = standardOrder
+            .filter(t => typeGroups[t] && typeGroups[t].length > 0)
+            .map(t => ({ 
+                type: t, 
+                items: typeGroups[t],
+                totalQty: typeGroups[t].reduce((sum, i) => sum + i.quantity, 0)
+            }));
+            
+        return { room, categories };
+    });
+  };
+
+  const handleAddItem = (room: string, type: CabinetType) => {
+      if (!project) return;
+      const newItem: CabinetItem = {
+          id: `manual_${Date.now()}`,
+          originalCode: "NEW ITEM",
+          quantity: 1,
+          type: type,
+          description: "Manual Entry",
+          width: 0, height: 0, depth: 0,
+          normalizedCode: "NEW ITEM",
+          room: room,
+          notes: "Manual Entry"
+      };
+      const newItems = [...project.items, newItem];
+      updateProject({ items: newItems });
+  };
+
+  const handleRenameRoom = (oldName: string, newName: string) => {
+      if (!project) return;
+      if (!newName || newName.trim() === "") return;
+      
+      const newItems = project.items.map(item => {
+          if ((item.room || "General") === oldName) {
+              return { ...item, room: newName };
+          }
+          return item;
+      });
+      updateProject({ items: newItems });
   };
 
   const generatePDFDocument = (proj: Project): jsPDF => {
@@ -456,79 +508,117 @@ export const QuotationFlow: React.FC = () => {
 
     yPos += 6 + specsBoxH + 4;
 
-    // --- PRODUCTS HEADER ---
-    doc.setFillColor(230, 230, 230);
-    doc.rect(leftMargin, yPos, boxWidth, 6, 'FD');
-    doc.setFont("helvetica", "bold");
-    doc.text(`Products for Kitchen: ${proj.name || 'Quote'}`, leftMargin + 2, yPos + 4.5);
-
-    // --- TABLE GENERATION ---
-    const tableBody: any[] = [];
-    validItems.forEach((item, index) => {
-        const itemNum = index + 1;
-        const desc = item.width > 0 
-            ? `${item.description} (${item.width}"W x ${item.height}"H x ${item.depth}"D)`
-            : item.description;
-
-        tableBody.push([
-            itemNum.toString(),
-            item.quantity.toString(),
-            item.originalCode,
-            desc,
-            `$${item.totalPrice.toLocaleString(undefined, {minimumFractionDigits: 2})}`
-        ]);
-
-        if (item.modifications) {
-            item.modifications.forEach((mod, mIndex) => {
-                tableBody.push([
-                    ``,
-                    '',
-                    mod.description.includes('FINISH END') ? (mod.description.includes('Left') ? 'FEL' : 'FER') : 'MOD',
-                    `${mod.description}`,
-                    `$${(mod.price || 0).toFixed(2)}`
-                ]);
-            });
-        }
-        
-        if (item.appliedOptions) {
-            let modCounter = (item.modifications?.length || 0) + 1;
-            item.appliedOptions.forEach((opt) => {
-                tableBody.push([
-                    ``,
-                    '',
-                    'OPT',
-                    `${opt.name}`,
-                    `$${opt.price.toFixed(2)}`
-                ]);
-                modCounter++;
-            });
-        }
+    // --- GROUPED ITEMS LOGIC ---
+    const roomGroups: Record<string, PricingLineItem[]> = {};
+    validItems.forEach(item => {
+        const room = item.room || "General / Additional Items";
+        if (!roomGroups[room]) roomGroups[room] = [];
+        roomGroups[room].push(item);
     });
 
-    autoTable(doc, {
-        startY: yPos + 6,
-        head: [['Item', 'Qty.', 'Product Code', 'Description', 'Price']],
-        body: tableBody,
-        theme: 'plain',
-        styles: { fontSize: 8, cellPadding: 2, lineColor: [200, 200, 200], lineWidth: 0.1, valign: 'middle' },
-        headStyles: { fillColor: [255, 255, 255], textColor: [0, 0, 0], fontStyle: 'bold', lineWidth: 0.1, lineColor: [200, 200, 200] },
-        columnStyles: {
-            0: { cellWidth: 10, halign: 'center' },
-            1: { cellWidth: 10, halign: 'center' },
-            2: { cellWidth: 35, fontStyle: 'bold' },
-            3: { cellWidth: 97 },
-            4: { cellWidth: 30, halign: 'right' }
-        },
-        margin: { left: 14, right: 14, top: 20, bottom: 20 },
-        didParseCell: (data) => {
-             if (data.section === 'body' && data.column.index === 4) {
-                 const text = data.cell.raw as string;
-                 if (text.includes('CHECK PRICE')) {
-                     data.cell.styles.textColor = [220, 38, 38];
-                     data.cell.styles.fontStyle = 'bold';
-                 }
-            }
+    // Start printing tables per room
+    Object.entries(roomGroups).forEach(([roomName, items]) => {
+        // Check for page break if close to bottom
+        if (yPos > doc.internal.pageSize.getHeight() - 40) {
+            doc.addPage();
+            yPos = 20;
         }
+
+        // Room Header
+        doc.setFillColor(240, 240, 240); // Slightly lighter gray for room header
+        doc.rect(leftMargin, yPos, boxWidth, 7, 'F');
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(10);
+        doc.setTextColor(0);
+        doc.text(`${roomName}`, leftMargin + 2, yPos + 5);
+        
+        yPos += 7;
+
+        // Table Body
+        const tableBody: any[] = [];
+        items.forEach((item, index) => {
+            const itemNum = index + 1;
+            const desc = item.width > 0 
+                ? `${item.description} (${item.width}"W x ${item.height}"H x ${item.depth}"D)`
+                : item.description;
+
+            tableBody.push([
+                itemNum.toString(),
+                item.quantity.toString(),
+                item.originalCode,
+                desc,
+                `$${item.totalPrice.toLocaleString(undefined, {minimumFractionDigits: 2})}`
+            ]);
+
+            if (item.modifications) {
+                item.modifications.forEach((mod) => {
+                    tableBody.push([
+                        ``,
+                        '',
+                        mod.description.includes('FINISH END') ? (mod.description.includes('Left') ? 'FEL' : 'FER') : 'MOD',
+                        `${mod.description}`,
+                        `$${(mod.price || 0).toFixed(2)}`
+                    ]);
+                });
+            }
+            
+            if (item.appliedOptions) {
+                item.appliedOptions.forEach((opt) => {
+                    tableBody.push([
+                        ``,
+                        '',
+                        'OPT',
+                        `${opt.name}`,
+                        `$${opt.price.toFixed(2)}`
+                    ]);
+                });
+            }
+        });
+
+        // AutoTable for this room
+        autoTable(doc, {
+            startY: yPos,
+            head: [['Item', 'Qty.', 'Product Code', 'Description', 'Price']],
+            body: tableBody,
+            theme: 'plain',
+            styles: { fontSize: 8, cellPadding: 2, lineColor: [200, 200, 200], lineWidth: 0.1, valign: 'middle' },
+            headStyles: { fillColor: [255, 255, 255], textColor: [0, 0, 0], fontStyle: 'bold', lineWidth: 0.1, lineColor: [200, 200, 200] },
+            columnStyles: {
+                0: { cellWidth: 10, halign: 'center' },
+                1: { cellWidth: 10, halign: 'center' },
+                2: { cellWidth: 35, fontStyle: 'bold' },
+                3: { cellWidth: 97 },
+                4: { cellWidth: 30, halign: 'right' }
+            },
+            margin: { left: 14, right: 14, top: 20, bottom: 20 },
+            didParseCell: (data) => {
+                 if (data.section === 'body' && data.column.index === 4) {
+                     const text = data.cell.raw as string;
+                     if (text.includes('CHECK PRICE')) {
+                         data.cell.styles.textColor = [220, 38, 38];
+                         data.cell.styles.fontStyle = 'bold';
+                     }
+                }
+            }
+        });
+
+        // Update yPos for next iteration
+        yPos = (doc as any).lastAutoTable.finalY + 2;
+
+        // Room Subtotal
+        const roomTotal = items.reduce((sum, i) => sum + i.totalPrice, 0);
+        
+        // Prevent page break split of subtotal
+        if (yPos > doc.internal.pageSize.getHeight() - 15) {
+            doc.addPage();
+            yPos = 20;
+        }
+
+        doc.setFontSize(9);
+        doc.setFont("helvetica", "bold");
+        doc.text(`${roomName} Total: $${roomTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}`, 196 - 14, yPos + 5, { align: 'right' });
+        
+        yPos += 12; // Gap before next room
     });
 
     // --- TOTALS ---
@@ -540,7 +630,7 @@ export const QuotationFlow: React.FC = () => {
 
     // Fix for Multi-page download:
     // Check if there is enough space for the summary on the current page.
-    let finalY = (doc as any).lastAutoTable.finalY;
+    let finalY = yPos;
     const pageHeight = doc.internal.pageSize.getHeight();
     const requiredSpaceForSummary = 80; // height of summary box + margins
 
@@ -554,7 +644,7 @@ export const QuotationFlow: React.FC = () => {
     doc.rect(leftMargin, finalY, boxWidth, 8, 'F');
     doc.setFontSize(10);
     doc.setFont("helvetica", "bold");
-    doc.text("Kitchen Sub Total", 110, finalY + 5.5);
+    doc.text("Project Sub Total", 110, finalY + 5.5);
     doc.text(`$${subTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}`, 196 - 14, finalY + 5.5, { align: 'right' });
 
     // Summary Box
@@ -629,8 +719,14 @@ export const QuotationFlow: React.FC = () => {
   const handleDownloadPDF = () => {
       if (!project) return;
       try {
+          const defaultName = `Order_${project.id.substring(0,6)}`;
+          const fileName = window.prompt("Enter filename for PDF:", defaultName);
+          if (!fileName) return; // User cancelled
+
           const doc = generatePDFDocument(project);
-          doc.save(`Order_${project.id.substring(0,6)}.pdf`);
+          // Ensure .pdf extension
+          const finalName = fileName.endsWith('.pdf') ? fileName : `${fileName}.pdf`;
+          doc.save(finalName);
       } catch (err) {
           console.error("PDF Generation Failed", err);
           alert("Failed to generate PDF. Please try again or reduce item count.");
@@ -642,11 +738,35 @@ export const QuotationFlow: React.FC = () => {
       setStep(6);
   };
 
-  // ... (Keep existing handleFileUpload, handleConfirmExtraction, handleConnectMfg, handleSpecsConfirmed, updateSpec, toggleOption)
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  const [isDragging, setIsDragging] = useState(false);
 
+  const handleDragOver = (e: React.DragEvent) => {
+      e.preventDefault();
+      setIsDragging(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+      e.preventDefault();
+      setIsDragging(false);
+  };
+
+  const handleDrop = async (e: React.DragEvent) => {
+      e.preventDefault();
+      setIsDragging(false);
+      
+      const files = e.dataTransfer.files;
+      if (files && files.length > 0) {
+          const file = files[0];
+          // Check type
+          if (file.type !== "application/pdf" && !file.type.startsWith("image/")) {
+              setUploadError("Only PDF or Image files are allowed.");
+              return;
+          }
+          await processUploadedFile(file);
+      }
+  };
+
+  const processUploadedFile = async (file: File) => {
     // Check file size immediately to prevent browser freeze/timeout
     if (file.size > 20 * 1024 * 1024) {
          setUploadError(`File is too large (${(file.size / 1024 / 1024).toFixed(1)}MB). Max size is 20MB. Please compress or split the PDF.`);
@@ -681,6 +801,12 @@ export const QuotationFlow: React.FC = () => {
         setIsLoading(false);
         setLoadingMessage("");
     }
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    await processUploadedFile(file);
   };
 
   const handleConfirmExtraction = () => setStep(2);
@@ -763,17 +889,24 @@ export const QuotationFlow: React.FC = () => {
   const updateDynamicSelection = (category: string, value: string) => {
       if (!project) return;
       const currentDyn = project.specs?.dynamicSelections || {};
+      
+      // Check for dependent resets
+      const updates: Partial<ProjectSpecs> = {};
       const newDyn = { ...currentDyn, [category]: value };
-      
-      // Also sync with legacy top-level fields for backward compatibility if needed
-      const updates: Partial<ProjectSpecs> = { dynamicSelections: newDyn };
-      
+
+      if (category === 'Collection') {
+          updates.seriesName = value; 
+          // Reset dependent Door Style when Collection changes
+          newDyn['DoorStyle'] = ''; 
+          updates.wallDoorStyle = '';
+      }
       if (category === 'Series') updates.seriesName = value;
       if (category === 'DoorStyle') updates.wallDoorStyle = value;
       if (category === 'Finish' || category === 'Paint' || category === 'Stain') updates.finishColor = value;
       if (category === 'Hinge') updates.hingeType = value;
       if (category === 'Drawer') updates.drawerBox = value;
 
+      updates.dynamicSelections = newDyn;
       const newSpecs = { ...project.specs, ...updates };
       updateProject({ specs: newSpecs });
   };
@@ -819,17 +952,55 @@ export const QuotationFlow: React.FC = () => {
   }
   if (currentMfg?.tiers?.length > 0) {
       currentMfg.tiers.forEach(t => {
-          if (t.name.includes(' - ')) {
-              const possibleStyle = t.name.split(' - ')[0];
-              if (!['Standard', 'Premium', 'Level', 'Group', 'Tier'].some(w => possibleStyle.includes(w))) {
-                   ensureGroup('DoorStyle');
-                   if (!groupedOptions['DoorStyle'].find(d => d.name === possibleStyle)) {
-                        groupedOptions['DoorStyle'].push({
-                            id: `tier_derived_${possibleStyle}`, name: possibleStyle, category: 'DoorStyle', section: 'Unknown', pricingType: 'included', price: 0
-                        });
-                   }
-              }
-          }
+          // Extract Collection if present
+          if (t.collection) {
+               ensureGroup('Collection');
+               if (!groupedOptions['Collection'].find(c => c.name === t.collection)) {
+                    groupedOptions['Collection'].push({
+                        id: `coll_${t.collection}`, 
+                        name: t.collection, 
+                        category: 'Collection', // Changed from 'Series' to 'Collection' for clarity
+                        section: 'B-Series', 
+                        pricingType: 'included', 
+                        price: 0
+                    });
+               }
+           }
+ 
+           let styleName = '';
+           if (t.collection) {
+                // If collection is known, try to strip it from the tier name
+                if (t.name.startsWith(t.collection)) {
+                    styleName = t.name.substring(t.collection.length).replace(/^[\s-:]+/, '');
+                } else {
+                    styleName = t.name;
+                }
+           } else if (t.name.includes(' - ')) {
+                // Fallback for "Collection - Style" format
+                styleName = t.name.split(' - ').slice(1).join(' - ');
+           } else {
+                styleName = t.name;
+           }
+
+           if (styleName && !['Standard', 'Premium', 'Level', 'Group', 'Tier'].some(w => styleName.includes(w))) {
+                ensureGroup('DoorStyle');
+                // We add ALL variations so we can filter by parentCollection later
+                // Check uniqueness by name AND parentCollection
+                const existing = groupedOptions['DoorStyle'].find(d => d.name === styleName && (d as any).parentCollection === t.collection);
+
+                if (!existing) {
+                     groupedOptions['DoorStyle'].push({
+                         id: `tier_derived_${t.collection || 'std'}_${styleName.replace(/\s+/g, '_')}`, 
+                         name: styleName, 
+                         category: 'DoorStyle', 
+                         section: 'Unknown', 
+                         pricingType: 'included', 
+                         price: 0,
+                         parentCollection: t.collection // Store for filtering
+                     } as any);
+                }
+           }
+
           // Extract Wood Species from Tier Names
           const commonWoods = ['Maple', 'Oak', 'Cherry', 'Alder', 'Walnut', 'Hickory', 'Birch', 'Poplar', 'MDF'];
           commonWoods.forEach(wood => {
@@ -847,7 +1018,7 @@ export const QuotationFlow: React.FC = () => {
 
   // Sort Categories Logic
   const categoryOrder = [
-      'Series', 'DoorStyle', 'Door', 'Wood', 'Finish', 'Paint', 'Stain', 'Glaze', 
+      'Collection', 'Series', 'DoorStyle', 'Door', 'Wood', 'Finish', 'Paint', 'Stain', 'Glaze', 
       'Construction', 'Drawer', 'Hardware', 'Hinge', 'Door Option', 'Door Edge', 'Highlight', 'PrintedEnd',
       'Toe Kick', 'Depth', 'Size'
   ];
@@ -861,12 +1032,6 @@ export const QuotationFlow: React.FC = () => {
       return a.localeCompare(b);
   });
 
-  // Dynamic Checklist Options (Upgrades or Priced items)
-  const checklistOptions = Object.values(groupedOptions).flat().filter(o => 
-      (o.category === 'Upgrade' || (o.price > 0 && o.pricingType !== 'included')) && 
-      !['Series', 'DoorStyle'].includes(o.category) // Exclude main selectors
-  );
-  
   return (
     <div className="pb-20">
       <div className="mb-8">
@@ -900,8 +1065,15 @@ export const QuotationFlow: React.FC = () => {
                  <h2 className="text-2xl font-bold text-slate-900">Upload Order or Plan</h2>
                  <p className="text-slate-500 mt-2 mb-6 max-w-sm">Drag & Drop your Order Acknowledgment (PDF) or Kitchen Plan. Our AI will extract codes and pricing.</p>
                  <input type="file" id="plan-upload" className="hidden" accept="image/*,.pdf" onChange={handleFileUpload}/>
-                 <div className="border-2 border-dashed border-slate-300 rounded-xl p-12 w-full max-w-lg hover:border-brand-500 hover:bg-brand-50 transition-all cursor-pointer relative" onClick={() => document.getElementById('plan-upload')?.click()}>
-                    <p className="font-medium text-slate-700">Click to Browse</p>
+                 <div 
+                    className={`border-2 border-dashed rounded-xl p-12 w-full max-w-lg transition-all cursor-pointer relative flex flex-col items-center justify-center ${isDragging ? 'border-brand-600 bg-brand-50' : 'border-slate-300 hover:border-brand-500 hover:bg-brand-50'}`}
+                    onDragOver={handleDragOver}
+                    onDragLeave={handleDragLeave}
+                    onDrop={handleDrop}
+                    onClick={() => document.getElementById('plan-upload')?.click()}
+                 >
+                    <UploadCloud className={`w-12 h-12 mb-4 ${isDragging ? 'text-brand-600' : 'text-slate-400'}`} />
+                    <p className="font-medium text-slate-700">{isDragging ? "Drop file here" : "Click to Browse or Drag File"}</p>
                  </div>
                  {uploadError && <div className="text-red-600 bg-red-50 p-3 rounded-lg"><AlertCircle className="w-4 h-4 inline mr-2"/>{uploadError}</div>}
              </div>
@@ -917,7 +1089,85 @@ export const QuotationFlow: React.FC = () => {
                     <table className="min-w-full divide-y divide-slate-200">
                          <thead className="bg-slate-100"><tr><th className="px-6 py-3 text-left text-xs font-bold text-slate-500 uppercase">Item Description</th><th className="px-6 py-3 text-left text-xs font-bold text-slate-500 uppercase">PDF Code (Editable)</th><th className="px-6 py-3 text-left text-xs font-bold text-brand-600 uppercase">Normalized</th><th className="px-6 py-3 text-center text-xs font-bold text-slate-500 uppercase">Qty (Editable)</th><th className="px-4 py-3 text-right text-xs font-bold text-slate-500 uppercase">Action</th></tr></thead>
                          <tbody className="divide-y divide-slate-100 bg-white">
-                            {groupedReviewItems.map(group => (<React.Fragment key={group.type}><tr className="bg-slate-50"><td colSpan={5} className="px-6 py-2 font-bold text-xs text-slate-600 uppercase tracking-wider">{group.type} Cabinets</td></tr>{group.items.map(item => (<tr key={item.id} className="hover:bg-blue-50 group"><td className="px-6 py-3 text-sm text-slate-900">{item.description}<div className="text-xs text-slate-400 mt-0.5">{item.width > 0 && `${item.width}" W x `}{item.height}" H x {item.depth}" D</div>{item.modifications && item.modifications.length > 0 && (<div className="mt-1 pl-2 border-l-2 border-slate-200 text-xs text-slate-500">{item.modifications.map((m, i) => (<div key={i}>+ {m.description}</div>))}</div>)}</td><td className="px-6 py-3 text-sm text-slate-500 font-mono"><DebouncedInput className="w-full bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5 font-bold text-slate-800" value={item.originalCode} onChange={(val: string) => updateProjectItem(item.id, { originalCode: val.toUpperCase() })}/></td><td className="px-6 py-3 text-sm text-brand-700 font-bold font-mono">{item.normalizedCode || item.originalCode}</td><td className="px-6 py-3 text-center font-medium"><DebouncedInput type="number" className="w-16 text-center bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5" value={item.quantity} onChange={(val: number) => updateProjectItem(item.id, { quantity: val || 0 })}/></td><td className="px-4 py-3 text-right"><button type="button" onClick={() => deleteProjectItem(item.id)} className="p-1.5 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded transition-colors" title="Remove Item"><Trash2 className="w-4 h-4"/></button></td></tr>))}</React.Fragment>))}
+                            {groupedReviewItems.map(roomGroup => (
+    <React.Fragment key={roomGroup.room}>
+        <tr className="bg-slate-100 border-t-2 border-slate-200">
+            <td colSpan={5} className="px-6 py-3 font-bold text-sm text-slate-800 uppercase tracking-wider">
+                <div className="flex items-center gap-2">
+                    <span className="bg-slate-300 text-slate-700 px-2 py-0.5 rounded text-xs">ROOM</span>
+                    <DebouncedInput 
+                        value={roomGroup.room} 
+                        onChange={(val: string) => handleRenameRoom(roomGroup.room, val)} 
+                        className="font-bold bg-transparent border-b border-dashed border-slate-400 focus:border-brand-500 outline-none text-slate-800 min-w-[200px]"
+                    />
+                </div>
+            </td>
+        </tr>
+        {roomGroup.categories.map(cat => (
+            <React.Fragment key={cat.type}>
+                <tr className="bg-slate-50">
+                    <td colSpan={5} className="px-6 py-2 font-bold text-xs text-slate-600 uppercase tracking-wider pl-12 border-l-4 border-l-brand-500">
+                        {cat.type} Cabinets ({cat.totalQty})
+                    </td>
+                </tr>
+                {cat.items.map(item => (
+                    <tr key={item.id} className="hover:bg-blue-50 group border-b border-slate-100">
+                        <td className="px-6 py-3 text-sm text-slate-900 pl-12">
+                            <DebouncedInput 
+                                className="w-full bg-transparent border-none focus:bg-white focus:ring-1 focus:ring-brand-500 px-1 py-0.5" 
+                                value={item.description} 
+                                onChange={(val: string) => updateProjectItem(item.id, { description: val })}
+                            />
+                            <div className="text-xs text-slate-400 mt-0.5">
+                                {item.width > 0 && `${item.width}" W x `}{item.height}" H x {item.depth}" D
+                            </div>
+                            {item.modifications && item.modifications.length > 0 && (
+                                <div className="mt-1 pl-2 border-l-2 border-slate-200 text-xs text-slate-500">
+                                    {item.modifications.map((m, i) => (<div key={i}>+ {m.description}</div>))}
+                                </div>
+                            )}
+                        </td>
+                        <td className="px-6 py-3 text-sm text-slate-500 font-mono">
+                            <DebouncedInput 
+                                className="w-full bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5 font-bold text-slate-800" 
+                                value={item.originalCode} 
+                                onChange={(val: string) => updateProjectItem(item.id, { originalCode: val.toUpperCase() })}
+                            />
+                        </td>
+                        <td className="px-6 py-3 text-sm text-brand-700 font-bold font-mono">
+                            {item.normalizedCode || item.originalCode}
+                        </td>
+                        <td className="px-6 py-3 text-center font-medium">
+                            <DebouncedInput 
+                                type="number" 
+                                className="w-16 text-center bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5" 
+                                value={item.quantity} 
+                                onChange={(val: number) => updateProjectItem(item.id, { quantity: val || 0 })}
+                            />
+                        </td>
+                        <td className="px-4 py-3 text-right">
+                            <button 
+                                type="button" 
+                                onClick={() => deleteProjectItem(item.id)} 
+                                className="p-1.5 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded transition-colors" 
+                                title="Remove Item"
+                            >
+                                <Trash2 className="w-4 h-4"/>
+                            </button>
+                        </td>
+                    </tr>
+                ))}
+                <tr className="bg-white">
+                    <td colSpan={5} className="px-6 py-2 pl-12">
+                         <Button variant="ghost" size="sm" onClick={() => handleAddItem(roomGroup.room, cat.type as CabinetType)} className="text-brand-600 hover:text-brand-700 hover:bg-brand-50 text-xs flex items-center gap-1">
+                             <Plus className="w-3 h-3" /> Add {cat.type}
+                         </Button>
+                    </td>
+                </tr>
+            </React.Fragment>
+        ))}
+    </React.Fragment>
+))}
                          </tbody>
                     </table>
                 </div>
@@ -961,67 +1211,98 @@ export const QuotationFlow: React.FC = () => {
                      <Button size="lg" onClick={handleSpecsConfirmed} className="gap-2 w-full sm:w-auto">Calculate Final Quote <ArrowRight className="w-4 h-4"/></Button>
                 </div>
                 {/* --- EXTERIOR DESIGN SECTION --- */}
-                <div className="border border-slate-300 rounded-lg overflow-hidden shadow-sm">
-                    <div className="bg-slate-100 px-6 py-3 border-b border-slate-300"><h3 className="font-bold text-slate-800 flex items-center gap-2"><PaintBucket className="w-4 h-4"/> Exterior Design</h3></div>
-                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-x-8 gap-y-6 p-6 bg-white">
-                        {['Series', 'DoorStyle', 'Wood', 'Finish', 'Glaze'].map(cat => {
-                             const options = groupedOptions[cat] || [];
-                             // Fallback: If no options are available, switch to Text Input
-                             // This prevents "Select..." dead ends and allows manual entry
-                             const isSelect = options.length > 0;
-                             
-                             return (
-                                <SpecField 
-                                    key={cat}
-                                    label={cat === 'Wood' ? 'Wood Species' : cat} 
-                                    type={isSelect ? "select" : "text"} 
-                                    options={isSelect ? Array.from(new Set(options.map(o => o.name))).map((name, i) => {
-                                        const opt = options.find(o => o.name === name);
-                                        let label = name;
-                                        if (opt && opt.pricingType !== 'included' && opt.price > 0) {
-                                            label += ` (${opt.pricingType === 'percentage' ? '+' + (opt.price * 100).toFixed(0) + '%' : '+$' + opt.price})`;
-                                        }
-                                        return { id: `${cat}_opt_${i}`, label, value: name };
-                                    }) : []}
-                                    value={project.specs?.dynamicSelections?.[cat] || ''} 
-                                    onChange={(v: string) => updateDynamicSelection(cat, v)} 
-                                />
-                             );
-                        })}
+                <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+                    <div className="bg-slate-50/80 px-8 py-4 border-b border-slate-200 flex items-center justify-between">
+                        <h3 className="text-lg font-bold text-slate-800 flex items-center gap-2">
+                            <PaintBucket className="w-5 h-5 text-brand-600"/> Exterior Finishes
+                        </h3>
+                        <div className="text-xs font-medium text-slate-500 bg-white border border-slate-200 px-2 py-1 rounded">Required Selection</div>
+                    </div>
+                    
+                    <div className="p-8 space-y-8">
+                        {/* Primary Selection: Collection -> Door Style */}
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                            {/* Collection */}
+                            <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:border-brand-300 transition-colors">
+                                <label className="block text-xs font-bold text-slate-500 uppercase tracking-wide mb-2">Cabinet Collection / Series</label>
+                                {(() => {
+                                    const options = groupedOptions['Collection'] || [];
+                                    const isSelect = options.length > 0;
+                                    return (
+                                        <SpecField 
+                                            key="Collection"
+                                            label="Collection"
+                                            type={isSelect ? "select" : "text"} 
+                                            options={isSelect ? Array.from(new Set(options.map(o => o.name))).map((name, i) => ({ id: `coll_${i}`, label: name, value: name })) : []}
+                                            value={project.specs?.dynamicSelections?.['Collection'] || ''} 
+                                            onChange={(v: string) => updateDynamicSelection('Collection', v)} 
+                                        />
+                                    );
+                                })()}
+                                <p className="text-xs text-slate-400 mt-2">Select a collection first to see available door styles.</p>
+                            </div>
+
+                            {/* Door Style */}
+                            <div className={`p-6 rounded-lg border transition-colors ${project.specs?.dynamicSelections?.['Collection'] ? 'bg-white border-brand-200 shadow-sm' : 'bg-slate-50 border-slate-200 opacity-70'}`}>
+                                <label className="block text-xs font-bold text-slate-500 uppercase tracking-wide mb-2 flex justify-between">
+                                    <span>Door Style</span>
+                                    {project.specs?.dynamicSelections?.['Collection'] && <span className="text-brand-600">Active</span>}
+                                </label>
+                                {(() => {
+                                    let options = groupedOptions['DoorStyle'] || [];
+                                    const selectedCollection = project?.specs?.dynamicSelections?.['Collection'];
+                                    
+                                    if (selectedCollection) {
+                                        options = options.filter(o => (o as any).parentCollection === selectedCollection);
+                                    } else if (groupedOptions['Collection'] && groupedOptions['Collection'].length > 0) {
+                                        options = []; // Hide door styles until collection is picked
+                                    }
+
+                                    const isSelect = options.length > 0;
+                                    
+                                    return (
+                                        <SpecField 
+                                            key="DoorStyle"
+                                            label="Door Style"
+                                            type={isSelect ? "select" : "text"} 
+                                            options={isSelect ? Array.from(new Set(options.map(o => o.name))).map((name, i) => ({ id: `door_${i}`, label: name, value: name })) : []}
+                                            value={project.specs?.dynamicSelections?.['DoorStyle'] || ''} 
+                                            onChange={(v: string) => updateDynamicSelection('DoorStyle', v)} 
+                                        />
+                                    );
+                                })()}
+                            </div>
+                        </div>
+
+                        {/* Secondary Finishes: Wood, Finish, Glaze, etc. */}
+                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6 pt-4 border-t border-slate-100">
+                             {['Wood', 'Finish', 'Paint', 'Stain', 'Glaze'].map(cat => {
+                                 const options = groupedOptions[cat] || [];
+                                 if (options.length === 0) return null;
+                                 
+                                 return (
+                                    <div key={cat} className="space-y-1">
+                                        <label className="text-xs font-bold text-slate-500 uppercase">{cat === 'Wood' ? 'Wood Species' : cat}</label>
+                                        <SpecField 
+                                            label={cat} 
+                                            type="select" 
+                                            options={Array.from(new Set(options.map(o => o.name))).map((name, i) => {
+                                                const opt = options.find(o => o.name === name);
+                                                let label = name;
+                                                if (opt && opt.pricingType !== 'included' && opt.price > 0) {
+                                                    label += ` (${opt.pricingType === 'percentage' ? '+' + (opt.price * 100).toFixed(0) + '%' : '+$' + opt.price})`;
+                                                }
+                                                return { id: `${cat}_opt_${i}`, label, value: name };
+                                            })}
+                                            value={project.specs?.dynamicSelections?.[cat] || ''} 
+                                            onChange={(v: string) => updateDynamicSelection(cat, v)} 
+                                        />
+                                    </div>
+                                 );
+                             })}
+                        </div>
                     </div>
                 </div>
-
-                {/* --- CONSTRUCTION & HARDWARE SECTION --- */}
-                <div className="border border-slate-300 rounded-lg overflow-hidden shadow-sm">
-                    <div className="bg-slate-100 px-6 py-3 border-b border-slate-300"><h3 className="font-bold text-slate-800 flex items-center gap-2"><Hammer className="w-4 h-4"/> Construction & Hardware</h3></div>
-                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-x-8 gap-y-6 p-6 bg-white">
-                        {['Construction', 'Drawer', 'Hinge', 'PrintedEnd'].map(cat => {
-                             const options = groupedOptions[cat] || [];
-                             if (options.length === 0 && cat !== 'Construction' && cat !== 'Drawer' && cat !== 'Hinge') return null; // Hide non-core if empty
-
-                             const isSelect = options.length > 0;
-                             
-                             return (
-                                <SpecField 
-                                    key={cat}
-                                    label={cat === 'PrintedEnd' ? 'Printed Ends' : cat} 
-                                    type={isSelect ? "select" : "text"} 
-                                    options={isSelect ? Array.from(new Set(options.map(o => o.name))).map((name, i) => {
-                                        const opt = options.find(o => o.name === name);
-                                        let label = name;
-                                        if (opt && opt.pricingType !== 'included' && opt.price > 0) {
-                                            label += ` (${opt.pricingType === 'percentage' ? '+' + (opt.price * 100).toFixed(0) + '%' : '+$' + opt.price})`;
-                                        }
-                                        return { id: `${cat}_opt_${i}`, label, value: name };
-                                    }) : []}
-                                    value={project.specs?.dynamicSelections?.[cat] || ''} 
-                                    onChange={(v: string) => updateDynamicSelection(cat, v)} 
-                                />
-                             );
-                        })}
-                    </div>
-                </div>
-                {checklistOptions.length > 0 && (<div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm mt-6"><h4 className="font-bold text-slate-800 mb-4 flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-brand-600"/> Additional Upgrades & Options</h4><div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">{checklistOptions.map((opt, idx) => (<label key={opt.id || `check_${idx}`} className="flex items-start gap-3 p-3 hover:bg-slate-50 rounded cursor-pointer border border-slate-100 hover:border-brand-200 transition-all"><input type="checkbox" className="mt-1 w-4 h-4 text-brand-600 rounded border-gray-300 focus:ring-brand-500" checked={!!project.specs?.selectedOptions?.[opt.id]} onChange={(e) => toggleOption(opt.id, e.target.checked)}/><div className="text-sm"><div className="font-medium text-slate-900">{opt.name}</div><div className="text-slate-500 text-xs flex justify-between gap-4 mt-1"><span>{opt.category}</span><span className="font-mono text-brand-700 font-bold">{opt.pricingType === 'percentage' ? `+${(opt.price*100).toFixed(0)}%` : `+$${opt.price}`}</span></div></div></label>))}</div></div>)}
              </div>
         )}
         
@@ -1041,64 +1322,102 @@ export const QuotationFlow: React.FC = () => {
                 </div>
 
                 <div className="flex flex-col lg:flex-row gap-6">
-                    <div className="flex-1 overflow-x-auto border border-slate-200 rounded-lg shadow-sm">
-                        <table className="min-w-full divide-y divide-slate-200">
-                            <thead className="bg-slate-800 text-white"><tr><th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider">#</th><th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider">Cab Code</th><th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider">Description / Dims</th><th className="px-4 py-3 text-center text-xs font-bold uppercase tracking-wider">Qty</th><th className="px-4 py-3 text-right text-xs font-bold uppercase tracking-wider">Unit Price</th><th className="px-4 py-3 text-right text-xs font-bold uppercase tracking-wider">Total</th><th className="px-4 py-3 w-10"></th></tr></thead>
-                            <tbody className="bg-white divide-y divide-slate-100">
-                                {project.pricing.map((item, index) => (
-                                    <tr key={item.id} className={`hover:bg-slate-50 ${item.totalPrice === 0 ? 'bg-red-50/30' : ''}`}>
-                                        <td className="px-4 py-3 text-slate-400 text-sm">{index + 1}</td>
-                                        <td className="px-4 py-3 font-mono font-bold text-slate-800 text-sm">
-                                            <DebouncedInput 
-                                                className="w-full bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5 font-bold text-slate-800" 
-                                                value={item.originalCode} 
-                                                onChange={(val: string) => handleBOMUpdate(item.id, 'code', val)}
-                                            />
-                                            {item.originalCode !== item.normalizedCode && (<div className="text-xs text-slate-400 font-normal mt-0.5">Norm: {item.normalizedCode}</div>)}
-                                            <div className="text-[10px] text-slate-400 mt-1 truncate max-w-[150px]" title={item.source}>{item.source}</div>
-                                        </td>
-                                        <td className="px-4 py-3 text-sm text-slate-700"><div className="font-medium">{item.description}</div><div className="text-xs text-slate-500 mt-0.5">{item.width}"W x {item.height}"H x {item.depth}"D</div>{item.appliedOptions && item.appliedOptions.length > 0 && (<div className="mt-1 flex flex-wrap gap-1">{item.appliedOptions.map((opt, i) => (<span key={i} className="text-[10px] bg-green-50 text-green-700 px-1.5 py-0.5 rounded border border-green-100">+{opt.name} (${opt.price})</span>))}</div>)}</td>
-                                        <td className="px-4 py-3 text-center text-sm font-medium">
-                                            <DebouncedInput 
-                                                type="number" 
-                                                className="w-16 text-center bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5" 
-                                                value={item.quantity} 
-                                                onChange={(val: number) => handleBOMUpdate(item.id, 'quantity', val)}
-                                            />
-                                        </td>
-                                        <td className="px-4 py-3 text-right text-sm">
-                                            <div className="flex items-center justify-end gap-1">
-                                                <span className="text-slate-400 text-xs">$</span>
-                                                <DebouncedInput 
-                                                    type="number" 
-                                                    className={`w-20 text-right bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5 ${item.finalUnitPrice === 0 ? 'text-red-600 font-bold' : 'text-slate-600'}`}
-                                                    value={item.finalUnitPrice} 
-                                                    onChange={(val: number) => handleBOMUpdate(item.id, 'price', val)}
-                                                />
-                                            </div>
-                                            {item.finalUnitPrice === 0 && (
-                                                <div className="text-[10px] text-red-500 mt-1 text-right font-bold flex items-center justify-end gap-1"><AlertCircle className="w-3 h-3"/> CHECK PRICE</div>
-                                            )}
-                                        </td>
-                                        <td className="px-4 py-3 text-right text-sm font-bold">{item.totalPrice === 0 ? (<span className="text-red-600">$0.00</span>) : (<span className="text-slate-900">${item.totalPrice.toLocaleString()}</span>)}</td>
-                                        <td className="px-4 py-3 text-center">
-                                            <button 
-                                                onClick={() => deleteProjectItem(item.id)}
-                                                className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors"
-                                                title="Delete Item"
-                                            >
-                                                <Trash2 className="w-4 h-4" />
-                                            </button>
-                                        </td>
-                                    </tr>
-                                ))}
-                            </tbody>
-                        </table>
-                        <div className="p-3 bg-slate-50 border-t border-slate-200">
-                             <Button variant="ghost" onClick={addBOMItem} className="text-brand-600 hover:text-brand-700 hover:bg-brand-50 w-full flex justify-center items-center gap-2 border border-dashed border-brand-200">
-                                 <Plus className="w-4 h-4" /> Add Manual Item
-                             </Button>
-                        </div>
+                    <div className="flex-1 overflow-x-auto border border-slate-200 rounded-lg shadow-sm bg-white">
+                        
+                        {/* --- NEW: CATALOG ITEM ADDER --- */}
+                        {/* REMOVED: Catalog Item Adder Dropdowns as per user request */}
+
+                        {(() => {
+                            const groups: Record<string, PricingLineItem[]> = {};
+                            project.pricing.forEach(item => {
+                                const room = item.room || "General";
+                                if (!groups[room]) groups[room] = [];
+                                groups[room].push(item);
+                            });
+
+                            return Object.entries(groups).map(([roomName, items]) => (
+                                <div key={roomName} className="mb-8 border border-slate-200 rounded-lg overflow-hidden">
+                                    <div className="bg-slate-100 px-4 py-3 border-b border-slate-200 flex justify-between items-center">
+                                        <div className="flex items-center gap-2">
+                                            <Layers className="w-4 h-4 text-slate-500" />
+                                            <h3 className="font-bold text-slate-800">{roomName}</h3>
+                                            <span className="bg-slate-200 text-slate-600 px-2 py-0.5 rounded-full text-xs font-medium">{items.length} items</span>
+                                        </div>
+                                        <span className="text-sm font-bold text-slate-700">
+                                            Subtotal: <span className="text-slate-900">${items.reduce((acc, i) => acc + i.totalPrice, 0).toLocaleString()}</span>
+                                        </span>
+                                    </div>
+                                    
+                                    <table className="min-w-full divide-y divide-slate-200">
+                                        <thead className="bg-slate-50 text-slate-500">
+                                            <tr>
+                                                <th className="px-4 py-2 text-left text-xs font-bold uppercase tracking-wider">#</th>
+                                                <th className="px-4 py-2 text-left text-xs font-bold uppercase tracking-wider">Cab Code</th>
+                                                <th className="px-4 py-2 text-left text-xs font-bold uppercase tracking-wider">Description</th>
+                                                <th className="px-4 py-2 text-center text-xs font-bold uppercase tracking-wider">Qty</th>
+                                                <th className="px-4 py-2 text-right text-xs font-bold uppercase tracking-wider">Unit Price</th>
+                                                <th className="px-4 py-2 text-right text-xs font-bold uppercase tracking-wider">Total</th>
+                                                <th className="px-4 py-2 w-10"></th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="bg-white divide-y divide-slate-100">
+                                            {items.map((item, index) => (
+                                                <tr key={item.id} className={`hover:bg-slate-50 ${item.totalPrice === 0 ? 'bg-red-50/30' : ''}`}>
+                                                    <td className="px-4 py-3 text-slate-400 text-sm">{index + 1}</td>
+                                                    <td className="px-4 py-3 font-mono font-bold text-slate-800 text-sm">
+                                                        <DebouncedInput 
+                                                            className="w-full bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5 font-bold text-slate-800" 
+                                                            value={item.originalCode} 
+                                                            onChange={(val: string) => handleBOMUpdate(item.id, 'code', val)}
+                                                        />
+                                                        {item.originalCode !== item.normalizedCode && (<div className="text-xs text-slate-400 font-normal mt-0.5">Norm: {item.normalizedCode}</div>)}
+                                                        <div className="text-[10px] text-slate-400 mt-1 truncate max-w-[150px]" title={item.source}>{item.source}</div>
+                                                    </td>
+                                                    <td className="px-4 py-3 text-sm text-slate-700"><div className="font-medium">{item.description}</div><div className="text-xs text-slate-500 mt-0.5">{item.width}"W x {item.height}"H x {item.depth}"D</div>{item.appliedOptions && item.appliedOptions.length > 0 && (<div className="mt-1 flex flex-wrap gap-1">{item.appliedOptions.map((opt, i) => (<span key={i} className="text-[10px] bg-green-50 text-green-700 px-1.5 py-0.5 rounded border border-green-100">+{opt.name} (${opt.price})</span>))}</div>)}</td>
+                                                    <td className="px-4 py-3 text-center text-sm font-medium">
+                                                        <DebouncedInput 
+                                                            type="number" 
+                                                            className="w-16 text-center bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5" 
+                                                            value={item.quantity} 
+                                                            onChange={(val: number) => handleBOMUpdate(item.id, 'quantity', val)}
+                                                        />
+                                                    </td>
+                                                    <td className="px-4 py-3 text-right text-sm">
+                                                        <div className="flex items-center justify-end gap-1">
+                                                            <span className="text-slate-400 text-xs">$</span>
+                                                            <DebouncedInput 
+                                                                type="number" 
+                                                                className={`w-20 text-right bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5 ${item.finalUnitPrice === 0 ? 'text-red-600 font-bold' : 'text-slate-600'}`}
+                                                                value={item.finalUnitPrice} 
+                                                                onChange={(val: number) => handleBOMUpdate(item.id, 'price', val)}
+                                                            />
+                                                        </div>
+                                                        {item.finalUnitPrice === 0 && (
+                                                            <div className="text-[10px] text-red-500 mt-1 text-right font-bold flex items-center justify-end gap-1"><AlertCircle className="w-3 h-3"/> CHECK PRICE</div>
+                                                        )}
+                                                    </td>
+                                                    <td className="px-4 py-3 text-right text-sm font-bold">{item.totalPrice === 0 ? (<span className="text-red-600">$0.00</span>) : (<span className="text-slate-900">${item.totalPrice.toLocaleString()}</span>)}</td>
+                                                    <td className="px-4 py-3 text-center">
+                                                        <button 
+                                                            onClick={() => deleteProjectItem(item.id)}
+                                                            className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors"
+                                                            title="Delete Item"
+                                                        >
+                                                            <Trash2 className="w-4 h-4" />
+                                                        </button>
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                    <div className="p-3 bg-slate-50 border-t border-slate-200">
+                                         <Button variant="ghost" onClick={() => addBOMItem(undefined, roomName)} className="text-brand-600 hover:text-brand-700 hover:bg-brand-50 w-full flex justify-center items-center gap-2 border border-dashed border-brand-200">
+                                             <Plus className="w-4 h-4" /> Add Item to {roomName}
+                                         </Button>
+                                    </div>
+                                </div>
+                            ));
+                        })()}
                     </div>
                     
                     <div className="w-full lg:w-80 shrink-0 space-y-4">
