@@ -994,8 +994,9 @@ export const QuotationFlow: React.FC = () => {
     setLoadingMessage(`Establishing connection to ${mfg.name} database...`);
     const catalogData = await storage.getManufacturerCatalog(mfg.id);
     mfg.catalog = catalogData;
-    setLoadingMessage(`Fetching ${mfg.tiers.length} pricing tiers...`);
-    await new Promise(r => setTimeout(r, 500));
+    const skuCount = catalogData ? Object.keys(catalogData).length : 0;
+    setLoadingMessage(`Loaded ${skuCount.toLocaleString()} SKUs across ${mfg.tiers.length} pricing tiers...`);
+    await new Promise(r => setTimeout(r, 800));
     const defaultSeries = mfg.series && mfg.series.length > 0 ? mfg.series[0].name : '';
     const defaultSpecs: any = {
         ...project?.specs,

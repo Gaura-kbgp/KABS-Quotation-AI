@@ -17,7 +17,7 @@ export const DrawingAI: React.FC = () => {
       </div>
       
       <div className="space-y-4 max-w-lg">
-          <h1 className="text-4xl font-extrabold text-slate-900">Drawing AI Generation</h1>
+          <h1 className="text-4xl font-extrabold text-slate-900">Design AI Generation</h1>
           <p className="text-lg text-slate-500">
             We are training advanced models to automatically generate 2D & 3D kitchen layouts from simple text descriptions and room dimensions.
           </p>
