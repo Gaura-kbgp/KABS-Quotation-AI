@@ -322,10 +322,10 @@ function extractFromChunk(chunk: string, items: CabinetItem[], pageNum: string, 
             const lowerHeader = potentialHeader.toLowerCase();
             const isKitchen = /\bkitchen\b/i.test(potentialHeader);
             const isBath = /\b(bath|bathroom|vanity|ensuite|powder|restroom|owners)\b/i.test(potentialHeader);
-            // REMOVED Laundry detection
-            const isLaundry = false; // /\b(laundry|utility|mud)\b/i.test(potentialHeader);
-            const isIsland = /\b(island)\b/i.test(potentialHeader);
-            const isOther = /\b(master|living|dining|pantry|bar|tech|foyer|entry)\b/i.test(potentialHeader);
+            // STRICT MODE: Disable Laundry, Island, Other unless they are part of a Kitchen/Bath context explicitly
+            const isLaundry = false; 
+            const isIsland = false; // Island usually implies Kitchen, so we handle it by defaulting to current kitchen or ignored
+            const isOther = false; 
             
             // Words that suggest this is NOT a header but a description
             const ignoredWords = [
@@ -360,13 +360,9 @@ function extractFromChunk(chunk: string, items: CabinetItem[], pageNum: string, 
                 // 1. STRONG MATCH EXTRACTION
                 // Instead of trying to clean garbage, extract ONLY what we know is a room name.
                 // This fixes "MIH 4031 MAGNOLIA STD OWNERS BATH GR 1951" -> "OWNERS BATH"
-                // REMOVED "Laundry" from regex to prevent it from starting a new room if user wants only Kitchen/Bath.
-                // Added "Utility" and "Mud" back just in case, but user seems to dislike them.
-                // If the user REALLY wants only Kitchen/Bath, we can restrict this further.
-                // But "Laundry" usually implies cabinets.
-                // UPDATE: User says "only bathroom and kitchen". I will remove "Laundry" from the start keyword list.
-                // If a room is explicitly named "Laundry Room", we might still catch it if it matches "Room".
-                const strongRoomRegex = /\b((?:Standard|Opt|Optional|Upgrade|Master|Guest|Owners|Ensuite|Powder|Main|Upper|Lower|Bsmt|Basement)?\s*(?:Kitchen|Bath(?:room)?|Pantry|Island|Dining|Living|Bed(?:room)?|Vanity|Bar|W\.?I\.?C\.?))\b(?:\s*(\d+))?/i;
+                // REMOVED "Laundry", "Pantry", "Island", "Dining", "Living", "Bed", "Bar", "WIC" from regex
+                // ONLY allow Kitchen and Bath variations.
+                const strongRoomRegex = /\b((?:Standard|Opt|Optional|Upgrade|Master|Guest|Owners|Ensuite|Powder|Main|Upper|Lower|Bsmt|Basement)?\s*(?:Kitchen|Bath(?:room)?|Vanity))\b(?:\s*(\d+))?/i;
                 
                 const strongMatch = detectedName.match(strongRoomRegex);
                 
