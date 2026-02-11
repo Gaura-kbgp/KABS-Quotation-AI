@@ -55,10 +55,10 @@ export async function extractTextFromPdf(file: File): Promise<string> {
                     const page = await pdf.getPage(pageNum);
                     const textContent = await page.getTextContent();
                     // Preserve layout by joining with newline instead of space
-                    // This prevents footers like "Page 1 of 10" from merging with content and causing the whole page to be skipped
                     const pageText = textContent.items
                         .map((item: any) => item.str)
                         .join('\n');
+                    console.log(`Page ${pageNum} text length: ${pageText.length}`);
                     return { pageNum, text: pageText };
                 } catch (pageErr) {
                     console.warn(`Failed to extract text from page ${pageNum}`, pageErr);
@@ -71,7 +71,8 @@ export async function extractTextFromPdf(file: File): Promise<string> {
             results.sort((a, b) => a.pageNum - b.pageNum);
             
             results.forEach(r => {
-                 fullText += `\n--- PAGE ${r.pageNum} ---\n${r.text}`;
+                 // Add extra newlines to ensure clean separation for regex splitting
+                 fullText += `\n\n--- PAGE ${r.pageNum} ---\n\n${r.text}`;
             });
         }
         

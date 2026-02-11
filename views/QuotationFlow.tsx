@@ -97,6 +97,7 @@ export const QuotationFlow: React.FC = () => {
   const [uploadError, setUploadError] = useState<string>('');
   const [isConnecting, setIsConnecting] = useState<string | null>(null);
   const [catalogCategoryFilter, setCatalogCategoryFilter] = useState<string>(''); // NEW: Catalog Filter
+  const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set()); // NEW: Multi-selection State
 
   // Financial State Local (synced with project)
   const [financials, setFinancials] = useState<ProjectFinancials>({
@@ -104,7 +105,11 @@ export const QuotationFlow: React.FC = () => {
       shippingCost: 0,
       discountRate: 0,
       fuelSurcharge: 0,
-      miscCharge: 0
+      miscCharge: 0,
+      pricingFactor: 1.0,
+      globalMargin: 0,
+      roomFactors: {},
+      categoryMargins: {}
   });
 
   // Details State
@@ -153,10 +158,53 @@ export const QuotationFlow: React.FC = () => {
     await storage.saveActiveProject(updated);
   };
 
-  const updateFinancials = (field: keyof ProjectFinancials, value: number) => {
+  const recalculateAllPricing = async (currentFinancials: ProjectFinancials, currentItems: CabinetItem[]) => {
+      if (!project || !project.manufacturerId) return;
+      
+      const mfg = manufacturers.find(m => m.id === project.manufacturerId);
+      if (!mfg) return;
+
+      // Ensure catalog is loaded
+      if (!mfg.catalog || Object.keys(mfg.catalog).length === 0) {
+          setIsLoading(true);
+          setLoadingMessage("Refreshing Price Book...");
+          mfg.catalog = await storage.getManufacturerCatalog(project.manufacturerId);
+          setIsLoading(false);
+          setLoadingMessage("");
+      }
+
+      const tierId = project.selectedTierId || 'default';
+      
+      // We need to re-run the pricing engine for ALL items
+      // This ensures Factor and Margin changes propagate
+      const newPricing = calculateProjectPricing(currentItems, mfg, tierId, project.specs, currentFinancials);
+      
+      updateProject({ pricing: newPricing, financials: currentFinancials });
+  };
+
+  const updateFinancials = async (field: keyof ProjectFinancials, value: number) => {
       const newFin = { ...financials, [field]: value };
       setFinancials(newFin);
-      updateProject({ financials: newFin });
+      
+      // If Pricing Logic fields change, we must re-calculate everything
+      if (field === 'pricingFactor' || field === 'globalMargin' || field === 'roomFactors') {
+          await recalculateAllPricing(newFin, project?.items || []);
+      } else {
+          updateProject({ financials: newFin });
+      }
+  };
+
+  const updateRoomFactor = async (roomName: string, factor: number | null) => {
+      const newRoomFactors = { ...financials.roomFactors };
+      if (factor === null) {
+          delete newRoomFactors[roomName];
+      } else {
+          newRoomFactors[roomName] = factor;
+      }
+      
+      const newFin = { ...financials, roomFactors: newRoomFactors };
+      setFinancials(newFin);
+      await recalculateAllPricing(newFin, project?.items || []);
   };
   
   const updateProjectItem = (itemId: string, updates: Partial<CabinetItem>) => {
@@ -205,7 +253,10 @@ export const QuotationFlow: React.FC = () => {
           totalPrice: 0,
           tierName: project.selectedTierId || 'Default',
           source: 'Manual Entry',
-          appliedOptions: []
+          appliedOptions: [],
+          unitCost: 0,
+          pricingFactor: financials.pricingFactor,
+          margin: financials.globalMargin
       };
 
       const newItems = [...project.items, newItem];
@@ -256,11 +307,17 @@ export const QuotationFlow: React.FC = () => {
                        setLoadingMessage("");
                    }
                    
-                   const rePricedItems = calculateProjectPricing([item], mfg, project.selectedTierId || 'default', project.specs);
+                   const rePricedItems = calculateProjectPricing([item], mfg, project.selectedTierId || 'default', project.specs, financials);
                    if (rePricedItems.length > 0) {
                        const newItem = rePricedItems[0];
                        item.basePrice = newItem.basePrice;
                        item.tierMultiplier = newItem.tierMultiplier;
+                       
+                       // Sync new fields
+                       (item as any).unitCost = (newItem as any).unitCost;
+                       (item as any).pricingFactor = (newItem as any).pricingFactor;
+                       (item as any).margin = (newItem as any).margin;
+                       
                        item.finalUnitPrice = newItem.finalUnitPrice;
                        item.totalPrice = newItem.totalPrice;
                        item.source = newItem.source;
@@ -351,7 +408,91 @@ export const QuotationFlow: React.FC = () => {
       updateProject({ items: newItems });
   };
 
-  const generatePDFDocument = (proj: Project): jsPDF => {
+  const handleAddRoom = () => {
+      if (!project) return;
+      const roomName = window.prompt("Enter new room name (e.g., 'Kitchen 2', 'Basement Bar'):");
+      if (!roomName || roomName.trim() === "") return;
+      
+      const newItem: CabinetItem = {
+          id: `manual_${Date.now()}`,
+          originalCode: "NOTE",
+          quantity: 1,
+          type: 'Accessory',
+          description: "New Room Created",
+          width: 0, height: 0, depth: 0,
+          normalizedCode: "NOTE",
+          room: roomName.trim(),
+          notes: "Initial Item"
+      };
+      
+      const newItems = [...project.items, newItem];
+      updateProject({ items: newItems });
+  };
+
+  const toggleSelection = (id: string) => {
+      const newSet = new Set(selectedItems);
+      if (newSet.has(id)) {
+          newSet.delete(id);
+      } else {
+          newSet.add(id);
+      }
+      setSelectedItems(newSet);
+  };
+
+  const toggleRoomSelection = (roomName: string, items: CabinetItem[]) => {
+      const newSet = new Set(selectedItems);
+      const roomItemIds = items.map(i => i.id);
+      const allSelected = roomItemIds.every(id => newSet.has(id));
+
+      if (allSelected) {
+          roomItemIds.forEach(id => newSet.delete(id));
+      } else {
+          roomItemIds.forEach(id => newSet.add(id));
+      }
+      setSelectedItems(newSet);
+  };
+
+  const handleBulkDelete = () => {
+      if (!project) return;
+      if (!window.confirm(`Are you sure you want to delete ${selectedItems.size} selected items?`)) return;
+      
+      const newItems = project.items.filter(item => !selectedItems.has(item.id));
+      // Also clean up pricing items if they exist
+      let newPricing = project.pricing;
+      if (project.pricing) {
+          newPricing = project.pricing.filter(item => !selectedItems.has(item.id));
+      }
+      
+      updateProject({ items: newItems, pricing: newPricing });
+      setSelectedItems(new Set());
+  };
+
+  const handleBulkMove = () => {
+      if (!project) return;
+      // Get unique existing rooms to suggest (could be improved with a proper modal, but prompt is fast)
+      const roomName = window.prompt("Enter target room name (e.g., 'Kitchen', 'Laundry'):");
+      if (!roomName || roomName.trim() === "") return;
+      
+      const newItems = project.items.map(item => {
+          if (selectedItems.has(item.id)) {
+              return { ...item, room: roomName.trim() };
+          }
+          return item;
+      });
+      
+      updateProject({ items: newItems });
+      setSelectedItems(new Set());
+  };
+
+  const handleDeleteRoom = (roomName: string) => {
+      if (!project) return;
+      if (!window.confirm(`Are you sure you want to delete the entire room "${roomName}" and all its items?`)) return;
+      
+      const newItems = project.items.filter(item => (item.room || "General") !== roomName);
+      updateProject({ items: newItems });
+  };
+
+  const generatePDFDocument = (proj: Project, summaryOnly: boolean = false): jsPDF => {
     if (!proj || !proj.pricing) throw new Error("No project data");
     const doc = new jsPDF();
     const today = new Date().toLocaleDateString();
@@ -371,7 +512,7 @@ export const QuotationFlow: React.FC = () => {
 
     doc.setFontSize(16);
     doc.setFont("helvetica", "bold");
-    doc.text("Order", 170, 18, { align: 'right' });
+    doc.text(summaryOnly ? "Proposal Summary" : "Order", 170, 18, { align: 'right' });
     
     doc.setFontSize(9);
     doc.setFont("helvetica", "normal");
@@ -514,110 +655,147 @@ export const QuotationFlow: React.FC = () => {
         roomGroups[room].push(item);
     });
 
-    // Start printing tables per room
-    Object.entries(roomGroups).forEach(([roomName, items]) => {
-        // Check for page break if close to bottom
-        if (yPos > doc.internal.pageSize.getHeight() - 40) {
-            doc.addPage();
-            yPos = 20;
-        }
-
-        // Room Header
-        doc.setFillColor(240, 240, 240); // Slightly lighter gray for room header
-        doc.rect(leftMargin, yPos, boxWidth, 7, 'F');
-        doc.setFont("helvetica", "bold");
-        doc.setFontSize(10);
-        doc.setTextColor(0);
-        doc.text(`${roomName}`, leftMargin + 2, yPos + 5);
-        
-        yPos += 7;
-
-        // Table Body
-        const tableBody: any[] = [];
-        items.forEach((item, index) => {
-            const itemNum = index + 1;
-            const desc = item.width > 0 
-                ? `${item.description} (${item.width}"W x ${item.height}"H x ${item.depth}"D)`
-                : item.description;
-
-            tableBody.push([
-                itemNum.toString(),
-                item.quantity.toString(),
-                item.originalCode,
-                desc,
-                `$${item.totalPrice.toLocaleString(undefined, {minimumFractionDigits: 2})}`
-            ]);
-
-            if (item.modifications) {
-                item.modifications.forEach((mod) => {
-                    tableBody.push([
-                        ``,
-                        '',
-                        mod.description.includes('FINISH END') ? (mod.description.includes('Left') ? 'FEL' : 'FER') : 'MOD',
-                        `${mod.description}`,
-                        `$${(mod.price || 0).toFixed(2)}`
-                    ]);
-                });
-            }
-            
-            if (item.appliedOptions) {
-                item.appliedOptions.forEach((opt) => {
-                    tableBody.push([
-                        ``,
-                        '',
-                        'OPT',
-                        `${opt.name}`,
-                        `$${opt.price.toFixed(2)}`
-                    ]);
-                });
-            }
-        });
-
-        // AutoTable for this room
-        autoTable(doc, {
+    if (summaryOnly) {
+         // --- SUMMARY TABLE ---
+         const summaryBody: any[] = [];
+         
+         Object.entries(roomGroups).forEach(([roomName, items]) => {
+             const roomTotal = items.reduce((sum, i) => sum + i.totalPrice, 0);
+             const itemCount = items.reduce((sum, i) => sum + i.quantity, 0);
+             const desc = `Cabinetry, Moldings & Accessories - ${s.wallDoorStyle || 'Standard'}`;
+             
+             summaryBody.push([
+                 roomName,
+                 desc,
+                 `${itemCount} items`,
+                 `$${roomTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}`
+             ]);
+         });
+         
+         autoTable(doc, {
             startY: yPos,
-            head: [['Item', 'Qty.', 'Product Code', 'Description', 'Price']],
-            body: tableBody,
+            head: [['Room / Area', 'Description', 'Quantity', 'Total Price']],
+            body: summaryBody,
             theme: 'plain',
-            styles: { fontSize: 8, cellPadding: 2, lineColor: [200, 200, 200], lineWidth: 0.1, valign: 'middle' },
-            headStyles: { fillColor: [255, 255, 255], textColor: [0, 0, 0], fontStyle: 'bold', lineWidth: 0.1, lineColor: [200, 200, 200] },
+            styles: { fontSize: 9, cellPadding: 3, lineColor: [200, 200, 200], lineWidth: 0.1, valign: 'middle' },
+            headStyles: { fillColor: [240, 240, 240], textColor: [0, 0, 0], fontStyle: 'bold', lineWidth: 0.1, lineColor: [200, 200, 200] },
             columnStyles: {
-                0: { cellWidth: 10, halign: 'center' },
-                1: { cellWidth: 10, halign: 'center' },
-                2: { cellWidth: 35, fontStyle: 'bold' },
-                3: { cellWidth: 97 },
-                4: { cellWidth: 30, halign: 'right' }
+                0: { cellWidth: 50, fontStyle: 'bold' },
+                1: { cellWidth: 80 },
+                2: { cellWidth: 30, halign: 'center' },
+                3: { cellWidth: 30, halign: 'right' }
             },
-            margin: { left: 14, right: 14, top: 20, bottom: 20 },
-            didParseCell: (data) => {
-                 if (data.section === 'body' && data.column.index === 4) {
-                     const text = data.cell.raw as string;
-                     if (text.includes('CHECK PRICE')) {
-                         data.cell.styles.textColor = [220, 38, 38];
-                         data.cell.styles.fontStyle = 'bold';
-                     }
-                }
+            margin: { left: 14, right: 14 },
+         });
+         
+         yPos = (doc as any).lastAutoTable.finalY + 10;
+
+    } else {
+        //Start printing tables per room
+        Object.entries(roomGroups).forEach(([roomName, items]) => {
+            // Check for page break if close to bottom
+            if (yPos > doc.internal.pageSize.getHeight() - 40) {
+                doc.addPage();
+                yPos = 20;
             }
+
+            // Room Header
+            doc.setFillColor(240, 240, 240); // Slightly lighter gray for room header
+            doc.rect(leftMargin, yPos, boxWidth, 7, 'F');
+            doc.setFont("helvetica", "bold");
+            doc.setFontSize(10);
+            doc.setTextColor(0);
+            doc.text(`${roomName}`, leftMargin + 2, yPos + 5);
+            
+            yPos += 7;
+
+            // Table Body
+            const tableBody: any[] = [];
+            items.forEach((item, index) => {
+                const itemNum = index + 1;
+                const desc = item.width > 0 
+                    ? `${item.description} (${item.width}"W x ${item.height}"H x ${item.depth}"D)`
+                    : item.description;
+
+                tableBody.push([
+                    itemNum.toString(),
+                    item.quantity.toString(),
+                    item.originalCode,
+                    desc,
+                    `$${item.totalPrice.toLocaleString(undefined, {minimumFractionDigits: 2})}`
+                ]);
+
+                if (item.modifications) {
+                    item.modifications.forEach((mod) => {
+                        tableBody.push([
+                            ``,
+                            '',
+                            mod.description.includes('FINISH END') ? (mod.description.includes('Left') ? 'FEL' : 'FER') : 'MOD',
+                            `${mod.description}`,
+                            `$${(mod.price || 0).toFixed(2)}`
+                        ]);
+                    });
+                }
+                
+                if (item.appliedOptions) {
+                    item.appliedOptions.forEach((opt) => {
+                        tableBody.push([
+                            ``,
+                            '',
+                            'OPT',
+                            `${opt.name}`,
+                            `$${opt.price.toFixed(2)}`
+                        ]);
+                    });
+                }
+            });
+
+            // AutoTable for this room
+            autoTable(doc, {
+                startY: yPos,
+                head: [['Item', 'Qty.', 'Product Code', 'Description', 'Price']],
+                body: tableBody,
+                theme: 'plain',
+                styles: { fontSize: 8, cellPadding: 2, lineColor: [200, 200, 200], lineWidth: 0.1, valign: 'middle' },
+                headStyles: { fillColor: [255, 255, 255], textColor: [0, 0, 0], fontStyle: 'bold', lineWidth: 0.1, lineColor: [200, 200, 200] },
+                columnStyles: {
+                    0: { cellWidth: 10, halign: 'center' },
+                    1: { cellWidth: 10, halign: 'center' },
+                    2: { cellWidth: 35, fontStyle: 'bold' },
+                    3: { cellWidth: 97 },
+                    4: { cellWidth: 30, halign: 'right' }
+                },
+                margin: { left: 14, right: 14, top: 20, bottom: 20 },
+                didParseCell: (data) => {
+                     if (data.section === 'body' && data.column.index === 4) {
+                         const text = data.cell.raw as string;
+                         if (text.includes('CHECK PRICE')) {
+                             data.cell.styles.textColor = [220, 38, 38];
+                             data.cell.styles.fontStyle = 'bold';
+                         }
+                    }
+                }
+            });
+
+            // Update yPos for next iteration
+            yPos = (doc as any).lastAutoTable.finalY + 2;
+
+            // Room Subtotal
+            const roomTotal = items.reduce((sum, i) => sum + i.totalPrice, 0);
+            
+            // Prevent page break split of subtotal
+            if (yPos > doc.internal.pageSize.getHeight() - 15) {
+                doc.addPage();
+                yPos = 20;
+            }
+
+            doc.setFontSize(9);
+            doc.setFont("helvetica", "bold");
+            doc.text(`${roomName} Total: $${roomTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}`, 196 - 14, yPos + 5, { align: 'right' });
+            
+            yPos += 12; // Gap before next room
         });
-
-        // Update yPos for next iteration
-        yPos = (doc as any).lastAutoTable.finalY + 2;
-
-        // Room Subtotal
-        const roomTotal = items.reduce((sum, i) => sum + i.totalPrice, 0);
-        
-        // Prevent page break split of subtotal
-        if (yPos > doc.internal.pageSize.getHeight() - 15) {
-            doc.addPage();
-            yPos = 20;
-        }
-
-        doc.setFontSize(9);
-        doc.setFont("helvetica", "bold");
-        doc.text(`${roomName} Total: $${roomTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}`, 196 - 14, yPos + 5, { align: 'right' });
-        
-        yPos += 12; // Gap before next room
-    });
+    }
 
     // --- TOTALS ---
     const subTotal = validItems.reduce((sum, i) => sum + i.totalPrice, 0);
@@ -714,14 +892,15 @@ export const QuotationFlow: React.FC = () => {
     return doc;
   };
 
-  const handleDownloadPDF = () => {
+  const handleDownloadPDF = (summary: boolean = false) => {
       if (!project) return;
       try {
-          const defaultName = `Order_${project.id.substring(0,6)}`;
+          const suffix = summary ? "_Summary" : "";
+          const defaultName = `Order_${project.id.substring(0,6)}${suffix}`;
           const fileName = window.prompt("Enter filename for PDF:", defaultName);
           if (!fileName) return; // User cancelled
 
-          const doc = generatePDFDocument(project);
+          const doc = generatePDFDocument(project, summary);
           // Ensure .pdf extension
           const finalName = fileName.endsWith('.pdf') ? fileName : `${fileName}.pdf`;
           doc.save(finalName);
@@ -869,7 +1048,7 @@ export const QuotationFlow: React.FC = () => {
              mfg.tiers = [{ id: 'default', name: 'Standard', multiplier: 1.0 }];
          }
          if (tierIdToUse) {
-             const pricing = calculateProjectPricing(project.items, mfg, tierIdToUse, project.specs);
+             const pricing = calculateProjectPricing(project.items, mfg, tierIdToUse, project.specs, financials);
              await updateProject({ pricing, selectedTierId: tierIdToUse });
              setIsLoading(false);
              setLoadingMessage("");
@@ -1085,40 +1264,63 @@ export const QuotationFlow: React.FC = () => {
                 </div>
                 <div className="overflow-hidden border border-slate-200 rounded-lg">
                     <table className="min-w-full divide-y divide-slate-200">
-                         <thead className="bg-slate-100"><tr><th className="px-6 py-3 text-left text-xs font-bold text-slate-500 uppercase">Item Description</th><th className="px-6 py-3 text-left text-xs font-bold text-slate-500 uppercase">PDF Code (Editable)</th><th className="px-6 py-3 text-left text-xs font-bold text-brand-600 uppercase">Normalized</th><th className="px-6 py-3 text-center text-xs font-bold text-slate-500 uppercase">Qty (Editable)</th><th className="px-4 py-3 text-right text-xs font-bold text-slate-500 uppercase">Action</th></tr></thead>
+                         <thead className="bg-slate-100"><tr><th className="w-10 px-3 py-3 text-center"><input type="checkbox" disabled className="rounded border-slate-300"/></th><th className="px-6 py-3 text-left text-xs font-bold text-slate-500 uppercase">Item Description</th><th className="px-6 py-3 text-left text-xs font-bold text-slate-500 uppercase">PDF Code (Editable)</th><th className="px-6 py-3 text-left text-xs font-bold text-brand-600 uppercase">Normalized</th><th className="px-6 py-3 text-center text-xs font-bold text-slate-500 uppercase">Qty (Editable)</th><th className="px-4 py-3 text-right text-xs font-bold text-slate-500 uppercase">Action</th></tr></thead>
                 <tbody className="divide-y divide-slate-100 bg-white">
                            {groupedReviewItems.map(roomGroup => (
    <React.Fragment key={roomGroup.room}>
        <tr className="bg-slate-100 border-t-2 border-slate-200">
-           <td colSpan={5} className="px-6 py-3 font-bold text-sm text-slate-800 uppercase tracking-wider">
-               <div className="flex items-center gap-2">
-                   <span className="bg-slate-300 text-slate-700 px-2 py-0.5 rounded text-xs">ROOM</span>
-                   <DebouncedInput 
-                       value={roomGroup.room} 
-                       onChange={(val: string) => handleRenameRoom(roomGroup.room, val)} 
-                       className="font-bold bg-transparent border-b border-dashed border-slate-400 focus:border-brand-500 outline-none text-slate-800 min-w-[200px]"
-                   />
-                   <span className="text-xs text-slate-500 ml-2">({roomGroup.totalQty} items)</span>
+           <td colSpan={6} className="px-3 py-3 font-bold text-sm text-slate-800 uppercase tracking-wider">
+               <div className="flex items-center justify-between">
+                   <div className="flex items-center gap-2">
+                       <input 
+                           type="checkbox" 
+                           className="rounded border-slate-300 text-brand-600 focus:ring-brand-500 h-4 w-4"
+                           checked={roomGroup.items.length > 0 && roomGroup.items.every(i => selectedItems.has(i.id))}
+                           onChange={() => toggleRoomSelection(roomGroup.room, roomGroup.items)}
+                       />
+                       <span className="bg-slate-300 text-slate-700 px-2 py-0.5 rounded text-xs">ROOM</span>
+                       <DebouncedInput 
+                           value={roomGroup.room} 
+                           onChange={(val: string) => handleRenameRoom(roomGroup.room, val)} 
+                           className="font-bold bg-transparent border-b border-dashed border-slate-400 focus:border-brand-500 outline-none text-slate-800 min-w-[200px]"
+                       />
+                       <span className="text-xs text-slate-500 ml-2">({roomGroup.totalQty} items)</span>
+                   </div>
+                   <button 
+                       onClick={() => handleDeleteRoom(roomGroup.room)}
+                       className="text-slate-400 hover:text-red-600 hover:bg-red-50 p-1 rounded transition-colors"
+                       title="Delete Entire Room"
+                   >
+                       <Trash2 className="w-4 h-4" />
+                   </button>
                </div>
            </td>
        </tr>
                {roomGroup.items.map(item => (
-                   <tr key={item.id} className="hover:bg-blue-50 group border-b border-slate-100">
-                       <td className="px-6 py-3 text-sm text-slate-900 pl-12">
-                           <DebouncedInput 
-                               className="w-full bg-transparent border-none focus:bg-white focus:ring-1 focus:ring-brand-500 px-1 py-0.5" 
-                               value={item.description} 
-                               onChange={(val: string) => updateProjectItem(item.id, { description: val })}
-                           />
-                           <div className="text-xs text-slate-400 mt-0.5">
-                               {item.width > 0 && `${item.width}" W x `}{item.height}" H x {item.depth}" D
-                           </div>
-                           {item.modifications && item.modifications.length > 0 && (
-                               <div className="mt-1 pl-2 border-l-2 border-slate-200 text-xs text-slate-500">
-                                   {item.modifications.map((m, i) => (<div key={i}>+ {m.description}</div>))}
-                               </div>
-                           )}
-                       </td>
+                    <tr key={item.id} className={`hover:bg-blue-50 group border-b border-slate-100 ${selectedItems.has(item.id) ? 'bg-blue-50' : ''}`}>
+                        <td className="px-3 py-3 text-center">
+                            <input 
+                                type="checkbox" 
+                                className="rounded border-slate-300 text-brand-600 focus:ring-brand-500 h-4 w-4"
+                                checked={selectedItems.has(item.id)}
+                                onChange={() => toggleSelection(item.id)}
+                            />
+                        </td>
+                        <td className="px-6 py-3 text-sm text-slate-900 pl-4">
+                            <DebouncedInput 
+                                className="w-full bg-transparent border-none focus:bg-white focus:ring-1 focus:ring-brand-500 px-1 py-0.5" 
+                                value={item.description} 
+                                onChange={(val: string) => updateProjectItem(item.id, { description: val })}
+                            />
+                            <div className="text-xs text-slate-400 mt-0.5">
+                                {item.width > 0 && `${item.width}" W x `}{item.height}" H x {item.depth}" D
+                            </div>
+                            {item.modifications && item.modifications.length > 0 && (
+                                <div className="mt-1 pl-2 border-l-2 border-slate-200 text-xs text-slate-500">
+                                    {item.modifications.map((m, i) => (<div key={i}>+ {m.description}</div>))}
+                                </div>
+                            )}
+                        </td>
                        <td className="px-6 py-3 text-sm text-slate-500 font-mono">
                            <DebouncedInput 
                                className="w-full bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5 font-bold text-slate-800" 
@@ -1150,17 +1352,54 @@ export const QuotationFlow: React.FC = () => {
                    </tr>
                ))}
                <tr className="bg-white">
-                   <td colSpan={5} className="px-6 py-2 pl-12">
-                        <Button variant="ghost" size="sm" onClick={() => handleAddItem(roomGroup.room, 'Base')} className="text-brand-600 hover:text-brand-700 hover:bg-brand-50 text-xs flex items-center gap-1">
-                            <Plus className="w-3 h-3" /> Add Item to {roomGroup.room}
-                        </Button>
-                   </td>
-               </tr>
+                    <td colSpan={6} className="px-6 py-2 pl-12">
+                         <Button variant="ghost" size="sm" onClick={() => handleAddItem(roomGroup.room, 'Base')} className="text-brand-600 hover:text-brand-700 hover:bg-brand-50 text-xs flex items-center gap-1">
+                             <Plus className="w-3 h-3" /> Add Item to {roomGroup.room}
+                         </Button>
+                    </td>
+                </tr>
    </React.Fragment>
 ))}
                         </tbody>
                     </table>
                 </div>
+                
+                <div className="flex justify-end pt-2">
+                    <Button 
+                        variant="outline" 
+                        size="sm" 
+                        onClick={handleAddRoom} 
+                        className="text-slate-600 hover:text-brand-600 border-dashed border-slate-300 bg-slate-50 hover:bg-white transition-all"
+                    >
+                        <Plus className="w-4 h-4 mr-2" /> Add New Room Group
+                    </Button>
+                </div>
+
+                {/* Floating Action Bar */}
+                {selectedItems.size > 0 && (
+                    <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-slate-900 text-white px-6 py-3 rounded-full shadow-lg flex items-center gap-4 animate-in slide-in-from-bottom-4 z-50">
+                        <span className="font-bold text-sm">{selectedItems.size} items selected</span>
+                        <div className="h-4 w-px bg-slate-700"></div>
+                        <button 
+                            onClick={handleBulkMove}
+                            className="text-sm font-medium hover:text-brand-400 transition-colors flex items-center gap-2"
+                        >
+                            <ArrowRight className="w-4 h-4" /> Move
+                        </button>
+                        <button 
+                            onClick={handleBulkDelete}
+                            className="text-sm font-medium hover:text-red-400 transition-colors flex items-center gap-2"
+                        >
+                            <Trash2 className="w-4 h-4" /> Delete
+                        </button>
+                        <button 
+                            onClick={() => setSelectedItems(new Set())}
+                            className="text-xs text-slate-400 hover:text-white transition-colors ml-2"
+                        >
+                            Cancel
+                        </button>
+                    </div>
+                )}
              </div>
         )}
         {step === 2 && (
@@ -1328,10 +1567,26 @@ export const QuotationFlow: React.FC = () => {
                             return Object.entries(groups).map(([roomName, items]) => (
                                 <div key={roomName} className="mb-8 border border-slate-200 rounded-lg overflow-hidden">
                                     <div className="bg-slate-100 px-4 py-3 border-b border-slate-200 flex justify-between items-center">
-                                        <div className="flex items-center gap-2">
-                                            <Layers className="w-4 h-4 text-slate-500" />
-                                            <h3 className="font-bold text-slate-800">{roomName}</h3>
-                                            <span className="bg-slate-200 text-slate-600 px-2 py-0.5 rounded-full text-xs font-medium">{items.length} items</span>
+                                        <div className="flex items-center gap-4">
+                                            <div className="flex items-center gap-2">
+                                                <Layers className="w-4 h-4 text-slate-500" />
+                                                <h3 className="font-bold text-slate-800">{roomName}</h3>
+                                                <span className="bg-slate-200 text-slate-600 px-2 py-0.5 rounded-full text-xs font-medium">{items.length} items</span>
+                                            </div>
+                                            <div className="flex items-center gap-2 text-xs">
+                                                <span className="text-slate-400">Factor:</span>
+                                                <DebouncedInput
+                                                    type="number"
+                                                    step="0.01"
+                                                    className={`w-16 px-1 py-0.5 border rounded text-center ${financials.roomFactors?.[roomName] ? 'border-brand-300 bg-brand-50 font-bold text-brand-700' : 'border-slate-300 bg-white text-slate-600'}`}
+                                                    placeholder={financials.pricingFactor.toString()}
+                                                    value={financials.roomFactors?.[roomName] ?? ''}
+                                                    onChange={(val: number | string) => {
+                                                        const numVal = val === '' ? null : Number(val);
+                                                        updateRoomFactor(roomName, numVal);
+                                                    }}
+                                                />
+                                            </div>
                                         </div>
                                         <span className="text-sm font-bold text-slate-700">
                                             Subtotal: <span className="text-slate-900">${items.reduce((acc, i) => acc + i.totalPrice, 0).toLocaleString()}</span>
@@ -1414,30 +1669,76 @@ export const QuotationFlow: React.FC = () => {
                         <div className="bg-slate-50 p-5 rounded-xl border border-slate-200">
                              <h3 className="font-bold text-slate-800 flex items-center gap-2 mb-4"><Calculator className="w-4 h-4"/> Quote Financials</h3>
                              <div className="space-y-4">
-                                 <div><label className="text-xs font-bold text-slate-500 uppercase">Dealer Discount (%)</label><div className="relative mt-1"><DebouncedInput type="number" min="0" max="100" className="w-full pl-3 pr-8 py-2 border border-slate-300 rounded text-sm focus:ring-2 focus:ring-brand-500" value={financials.discountRate} onChange={(val: number) => updateFinancials('discountRate', val || 0)} /><span className="absolute right-3 top-2 text-slate-400 text-sm">%</span></div></div>
+                                 {/* NEW PRICING LOGIC */}
+                                 <div className="p-3 bg-blue-50 border border-blue-100 rounded-lg space-y-3">
+                                     <h4 className="text-[10px] font-bold text-blue-800 uppercase tracking-wider mb-2">Cost & Margin Settings</h4>
+                                     
+                                     <div>
+                                         <label className="text-xs font-bold text-slate-500 uppercase">Pricing Factor (Cost)</label>
+                                         <div className="relative mt-1">
+                                             <DebouncedInput 
+                                                type="number" step="0.01" 
+                                                className="w-full pl-3 pr-3 py-2 border border-blue-200 rounded text-sm focus:ring-2 focus:ring-blue-500" 
+                                                value={financials.pricingFactor} 
+                                                onChange={(val: number) => updateFinancials('pricingFactor', val || 1.0)} 
+                                             />
+                                             <div className="text-[10px] text-slate-400 mt-1">Ex: 0.45 = 55% Off List</div>
+                                         </div>
+                                     </div>
+
+                                     <div>
+                                         <label className="text-xs font-bold text-slate-500 uppercase">Target Margin (%)</label>
+                                         <div className="relative mt-1">
+                                             <DebouncedInput 
+                                                type="number" step="1" 
+                                                className="w-full pl-3 pr-8 py-2 border border-blue-200 rounded text-sm focus:ring-2 focus:ring-blue-500" 
+                                                value={financials.globalMargin} 
+                                                onChange={(val: number) => updateFinancials('globalMargin', val || 0)} 
+                                             />
+                                             <span className="absolute right-3 top-2 text-slate-400 text-sm">%</span>
+                                         </div>
+                                     </div>
+                                 </div>
+
+                                 <div className="border-t border-slate-200 my-2"></div>
+
+                                 <div><label className="text-xs font-bold text-slate-500 uppercase">Add'l Discount (%)</label><div className="relative mt-1"><DebouncedInput type="number" min="0" max="100" className="w-full pl-3 pr-8 py-2 border border-slate-300 rounded text-sm focus:ring-2 focus:ring-brand-500" value={financials.discountRate} onChange={(val: number) => updateFinancials('discountRate', val || 0)} /><span className="absolute right-3 top-2 text-slate-400 text-sm">%</span></div></div>
                                  <div><label className="text-xs font-bold text-slate-500 uppercase">Sales Tax Rate (%)</label><div className="relative mt-1"><DebouncedInput type="number" min="0" max="100" step="0.1" className="w-full pl-3 pr-8 py-2 border border-slate-300 rounded text-sm focus:ring-2 focus:ring-brand-500" value={financials.taxRate} onChange={(val: number) => updateFinancials('taxRate', val || 0)} /><span className="absolute right-3 top-2 text-slate-400 text-sm">%</span></div></div>
-                                 <div><label className="text-xs font-bold text-slate-500 uppercase">Shipping Cost ($)</label><div className="relative mt-1"><span className="absolute left-3 top-2 text-slate-400 text-sm">$</span><DebouncedInput type="number" min="0" className="w-full pl-8 pr-3 py-2 border border-slate-300 rounded text-sm focus:ring-2 focus:ring-brand-500" value={financials.shippingCost} onChange={(val: number) => updateFinancials('shippingCost', val || 0)} /></div></div>
+                                 <div><label className="text-xs font-bold text-slate-500 uppercase">Freight / Shipping ($)</label><div className="relative mt-1"><span className="absolute left-3 top-2 text-slate-400 text-sm">$</span><DebouncedInput type="number" min="0" className="w-full pl-8 pr-3 py-2 border border-slate-300 rounded text-sm focus:ring-2 focus:ring-brand-500" value={financials.shippingCost} onChange={(val: number) => updateFinancials('shippingCost', val || 0)} /></div></div>
                                  <div><label className="text-xs font-bold text-slate-500 uppercase">Fuel Surcharge ($)</label><div className="relative mt-1"><span className="absolute left-3 top-2 text-slate-400 text-sm">$</span><DebouncedInput type="number" min="0" className="w-full pl-8 pr-3 py-2 border border-slate-300 rounded text-sm focus:ring-2 focus:ring-brand-500" value={financials.fuelSurcharge} onChange={(val: number) => updateFinancials('fuelSurcharge', val || 0)} /></div></div>
                                  <div><label className="text-xs font-bold text-slate-500 uppercase">Misc Charges ($)</label><div className="relative mt-1"><span className="absolute left-3 top-2 text-slate-400 text-sm">$</span><DebouncedInput type="number" min="0" className="w-full pl-8 pr-3 py-2 border border-slate-300 rounded text-sm focus:ring-2 focus:ring-brand-500" value={financials.miscCharge} onChange={(val: number) => updateFinancials('miscCharge', val || 0)} /></div></div>
                                  
                                  <div className="pt-4 border-t border-slate-200 mt-4">
                                      {(() => {
-                                         const subTotal = project.pricing.reduce((acc, i) => acc + i.totalPrice, 0);
-                                         const discountAmount = subTotal * (financials.discountRate / 100);
-                                         const postDiscount = subTotal - discountAmount;
+                                         // Use the updated logic: totalPrice IS the Sell Price (calculated with Margin)
+                                         const sellTotal = project.pricing.reduce((acc, i) => acc + i.totalPrice, 0);
+                                         
+                                         // Cost Calculation for Display (Optional)
+                                         const costTotal = project.pricing.reduce((acc, i) => acc + ((i as any).unitCost || 0) * i.quantity, 0);
+                                         const profit = sellTotal - costTotal;
+                                         const margin = sellTotal > 0 ? (profit / sellTotal) * 100 : 0;
+
+                                         // Additional Discount (Dealer Discount) applies to Sell Price
+                                         const discountAmount = sellTotal * (financials.discountRate / 100);
+                                         const postDiscount = sellTotal - discountAmount;
                                          const taxAmount = postDiscount * (financials.taxRate / 100);
                                          const grandTotal = postDiscount + financials.shippingCost + financials.fuelSurcharge + financials.miscCharge + taxAmount;
                                          
                                          return (
                                              <>
-                                                 <div className="flex justify-between text-sm mb-2"><span className="text-slate-500">Subtotal:</span><span className="font-medium">${subTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>
-                                                 <div className="flex justify-between text-sm mb-2"><span className="text-slate-500">Discount ({financials.discountRate}%):</span><span className="font-medium text-red-600">- ${discountAmount.toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>
-                                                 <div className="flex justify-between text-sm mb-2"><span className="text-slate-500">Net:</span><span className="font-medium">${postDiscount.toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>
+                                                 <div className="mb-4 pb-4 border-b border-dashed border-slate-200">
+                                                     <div className="flex justify-between text-xs mb-1 text-slate-400"><span>Est. Mfg Cost:</span><span>${costTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>
+                                                     <div className="flex justify-between text-xs mb-1 text-slate-400"><span>Est. Profit:</span><span className="text-green-600">${profit.toLocaleString(undefined, {minimumFractionDigits: 2})} ({margin.toFixed(1)}%)</span></div>
+                                                 </div>
+
+                                                 <div className="flex justify-between text-sm mb-2"><span className="text-slate-500">Sell Price Subtotal:</span><span className="font-medium">${sellTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>
+                                                 {financials.discountRate > 0 && <div className="flex justify-between text-sm mb-2"><span className="text-slate-500">Add'l Discount ({financials.discountRate}%):</span><span className="font-medium text-red-600">- ${discountAmount.toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>}
+                                                 <div className="flex justify-between text-sm mb-2"><span className="text-slate-500">Net Sell Price:</span><span className="font-medium">${postDiscount.toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>
                                                  {financials.taxRate > 0 && <div className="flex justify-between text-sm mb-2"><span className="text-slate-500">Tax ({financials.taxRate}%):</span><span className="font-medium">${taxAmount.toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>}
                                                  {(financials.shippingCost > 0 || financials.fuelSurcharge > 0 || financials.miscCharge > 0) && (
                                                      <div className="flex justify-between text-sm mb-2"><span className="text-slate-500">Fees:</span><span className="font-medium">${(financials.shippingCost + financials.fuelSurcharge + financials.miscCharge).toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>
                                                  )}
-                                                 <div className="flex justify-between text-base font-bold text-slate-900 mt-3 pt-3 border-t border-slate-200"><span>Est. Grand Total:</span><span>${grandTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>
+                                                 <div className="flex justify-between text-base font-bold text-slate-900 mt-3 pt-3 border-t border-slate-200"><span>Grand Total:</span><span>${grandTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>
                                              </>
                                          );
                                      })()}
@@ -1532,9 +1833,13 @@ export const QuotationFlow: React.FC = () => {
                  </p>
 
                  <div className="flex flex-col sm:flex-row gap-4 w-full max-w-md">
-                     <Button size="lg" onClick={handleDownloadPDF} className="w-full shadow-xl shadow-brand-500/20 py-6 text-lg h-auto flex-col gap-1">
+                     <Button size="lg" onClick={() => handleDownloadPDF()} className="w-full shadow-xl shadow-brand-500/20 py-6 text-lg h-auto flex-col gap-1">
                         <div className="flex items-center gap-2"><DownloadCloud className="w-6 h-6" /> Download PDF</div>
                         <span className="text-xs font-normal opacity-90">Official Quote Format</span>
+                     </Button>
+                     <Button size="lg" variant="outline" onClick={() => handleDownloadPDF(true)} className="w-full shadow-sm py-6 text-lg h-auto flex-col gap-1 border-dashed">
+                        <div className="flex items-center gap-2"><FileText className="w-6 h-6" /> Summary PDF</div>
+                        <span className="text-xs font-normal opacity-70">Room Totals Only</span>
                      </Button>
                  </div>
                  

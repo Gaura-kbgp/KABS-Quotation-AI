@@ -474,7 +474,8 @@ export const calculateProjectPricing = (
   items: CabinetItem[],
   manufacturer: Manufacturer,
   tierId: string, 
-  specs?: ProjectSpecs
+  specs?: ProjectSpecs,
+  financials?: any // Using any temporarily to avoid circular deps if types aren't fully propagated, but practically it's ProjectFinancials
 ): PricingLineItem[] => {
   const tier = manufacturer.tiers.find(t => t.id === tierId) || manufacturer.tiers[0];
   const tierNameForLookup = tier ? tier.name : (specs?.priceGroup || 'Standard');
@@ -632,19 +633,61 @@ export const calculateProjectPricing = (
          }
     });
 
-    const adjustedBase = basePrice * manufacturer.basePricingMultiplier;
-    const tierMultiplier = tier ? tier.multiplier : 1.0;
-    const finalUnitPrice = (adjustedBase + optionsPrice) * tierMultiplier;
-    const totalPrice = finalUnitPrice * item.quantity;
+    // --- NEW COST & PRICING LOGIC ---
+    // 1. Determine Factor (Room Specific or Global)
+    const globalFactor = financials?.pricingFactor || manufacturer.basePricingMultiplier || 1.0;
+    const roomFactor = (item.room && financials?.roomFactors?.[item.room]) 
+                        ? financials.roomFactors[item.room] 
+                        : globalFactor;
+
+    // 2. Calculate Cost
+    // List Price = (Base + Options) * Tier Multiplier (if tier has built-in factor, usually 1 for raw catalog)
+    // Actually, usually Catalog Price IS List Price.
+    const totalListPrice = (basePrice + optionsPrice);
+    
+    // Cost = List * Factor
+    const unitCost = totalListPrice * roomFactor;
+
+    // 3. Determine Margin
+    // Check for specific Series/Level margin override
+    // For now, simple global margin or category based
+    let margin = financials?.globalMargin || 0;
+    if (financials?.categoryMargins) {
+         // Try to match by Tier Name or Door Style
+         const tierName = tier ? tier.name : 'Standard';
+         if (financials.categoryMargins[tierName]) {
+             margin = financials.categoryMargins[tierName];
+         }
+    }
+    
+    // Normalize Margin (e.g. 35 -> 0.35)
+    const marginDecimal = margin > 1 ? margin / 100 : margin;
+
+    // 4. Calculate Sell Price
+    // Sell = Cost / (1 - Margin)
+    let unitSell = 0;
+    if (marginDecimal >= 1) {
+        unitSell = unitCost; // Prevent division by zero or negative
+    } else {
+        unitSell = unitCost / (1 - marginDecimal);
+    }
+
+    const totalPrice = unitSell * item.quantity;
 
     results.push({
       ...item,
       normalizedCode: matchedSku,
-      basePrice: Math.round(adjustedBase),
+      basePrice: Math.round(basePrice),
       optionsPrice: Math.round(optionsPrice),
-      tierMultiplier,
-      finalUnitPrice: Math.round(finalUnitPrice),
-      totalPrice: Math.round(totalPrice),
+      tierMultiplier: 1, // Deprecated in favor of Factor logic, but kept for types
+      
+      unitCost: Number(unitCost.toFixed(2)),
+      finalUnitPrice: Number(unitSell.toFixed(2)),
+      totalPrice: Number(totalPrice.toFixed(2)),
+      
+      pricingFactor: roomFactor,
+      margin: marginDecimal * 100,
+      
       tierName: tier ? tier.name : 'Standard',
       source,
       appliedOptions: appliedOptionsLog

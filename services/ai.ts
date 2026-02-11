@@ -192,6 +192,7 @@ interface RoomContext {
     currentRoom: string;
     counts: { [key: string]: number };
     lastKitchenRoom: string | null;
+    lastBathRoom: string | null;
 }
 
 function tryLocalRegexExtraction(text: string): CabinetItem[] {
@@ -201,7 +202,8 @@ function tryLocalRegexExtraction(text: string): CabinetItem[] {
     const context: RoomContext = {
         currentRoom: "Kitchen 1", // Default to Kitchen 1 instead of General
         counts: { kitchen: 1, bath: 0 }, // Start with 1 kitchen
-        lastKitchenRoom: "Kitchen 1"
+        lastKitchenRoom: "Kitchen 1",
+        lastBathRoom: null
     };
     
     // Updated Regex to allow:
@@ -211,24 +213,31 @@ function tryLocalRegexExtraction(text: string): CabinetItem[] {
     // It captures: [CodePart] (Space [SuffixPart])*
     // We limit suffixes to uppercase letters/digits/dashes to avoid capturing descriptions.
     // Broader regex to catch more valid codes
-    const codeRegex = /\b([A-Z]{1,4}\d{2,}(?:[ -][A-Z0-9]+)*)\b/g;
+    // const codeRegex = /\b([A-Z]{1,4}\d{2,}(?:[ -][A-Z0-9]+)*)\b/g; // Unused here, defined in extractFromChunk
     
     // Split by page markers first to assign rooms
     // extractTextFromPdf adds "\n--- PAGE X ---\n"
-    const pages = text.split(/--- PAGE (\d+) ---/);
+    // Use case-insensitive split and handle potential extra whitespace
+    const pages = text.split(/--- PAGE (\d+) ---/i);
     
     // pages[0] is usually empty or pre-text. 
     // Then we get [pageNum, pageContent, pageNum, pageContent...]
     
     let currentPageNum = "1";
     
+    console.log(`Local Regex Extraction: Found ${Math.floor(pages.length / 2)} pages of text.`);
+
     // If text was split by page markers, iterate through pages
     if (pages.length > 1) {
         for (let i = 1; i < pages.length; i += 2) {
              currentPageNum = pages[i];
              const pageContent = pages[i+1];
-             if (!pageContent) continue;
+             if (!pageContent) {
+                 console.warn(`Page ${currentPageNum} has empty content.`);
+                 continue;
+             }
              
+             // console.log(`Processing Page ${currentPageNum}...`);
              extractFromChunk(pageContent, items, currentPageNum, context);
         }
     } else {
@@ -322,8 +331,8 @@ function extractFromChunk(chunk: string, items: CabinetItem[], pageNum: string, 
             const lowerHeader = potentialHeader.toLowerCase();
             const isKitchen = /\bkitchen\b/i.test(potentialHeader);
             const isBath = /\b(bath|bathroom|vanity|ensuite|powder|restroom|owners)\b/i.test(potentialHeader);
-            // STRICT MODE: Disable Laundry, Island, Other unless they are part of a Kitchen/Bath context explicitly
-            const isLaundry = false; 
+            // STRICT MODE: Laundry should be separate as per user request
+            const isLaundry = /\b(laundry|utility|mud)\b/i.test(potentialHeader);
             const isIsland = false; // Island usually implies Kitchen, so we handle it by defaulting to current kitchen or ignored
             const isOther = false; 
             
@@ -360,9 +369,10 @@ function extractFromChunk(chunk: string, items: CabinetItem[], pageNum: string, 
                 // 1. STRONG MATCH EXTRACTION
                 // Instead of trying to clean garbage, extract ONLY what we know is a room name.
                 // This fixes "MIH 4031 MAGNOLIA STD OWNERS BATH GR 1951" -> "OWNERS BATH"
-                // REMOVED "Laundry", "Pantry", "Island", "Dining", "Living", "Bed", "Bar", "WIC" from regex
-                // ONLY allow Kitchen and Bath variations.
-                const strongRoomRegex = /\b((?:Standard|Opt|Optional|Upgrade|Master|Guest|Owners|Ensuite|Powder|Main|Upper|Lower|Bsmt|Basement)?\s*(?:Kitchen|Bath(?:room)?|Vanity))\b(?:\s*(\d+))?/i;
+                // REMOVED "Pantry", "Island", "Dining", "Living", "Bed", "Bar", "WIC" from regex
+                // ONLY allow Kitchen, Bath, Laundry variations.
+                // UPDATED: Allow intervening words (like "42" or "GMT") between prefix and room type to distinguish "Standard 42 Kitchen" vs "Opt GMT Kitchen"
+                const strongRoomRegex = /\b((?:(?:Standard|Opt|Optional|Upgrade|Master|Guest|Owners|Ensuite|Powder|Main|Upper|Lower|Bsmt|Basement|Gourmet)(?:\s+[\w\d\-\.]+){0,3}\s+)?(?:Kitchen|Bath(?:room)?|Vanity|Laundry|Utility))\b(?:\s*(\d+))?/i;
                 
                 const strongMatch = detectedName.match(strongRoomRegex);
                 
@@ -395,6 +405,9 @@ function extractFromChunk(chunk: string, items: CabinetItem[], pageNum: string, 
                     if (context.lastKitchenRoom) {
                          context.currentRoom = context.lastKitchenRoom;
                     }
+                    // Perimeter is part of kitchen, so don't clear lastBathRoom if we are bouncing between kitchen parts?
+                    // Usually Perimeter implies Kitchen.
+                    context.lastBathRoom = null; 
                 } else if (isKitchen) {
                     if (explicitNumberMatch) {
                          // Explicit "Kitchen 2"
@@ -410,10 +423,14 @@ function extractFromChunk(chunk: string, items: CabinetItem[], pageNum: string, 
                          }
                          context.currentRoom = context.lastKitchenRoom || "Kitchen 1";
                     } else {
-                         // Something like "Standard Kitchen" or "Gourmet Kitchen"
+                         // Something like "Standard Kitchen" or "Gourmet Kitchen" or "Standard 42 Kitchen"
+                         // Check if this new name is significantly different from the last one to warrant a new room
+                         // or if it's just a variation we should treat as a new room.
+                         // For safety, if it's not "Kitchen", assume it's a specific room name.
                          context.currentRoom = detectedName;
                          context.lastKitchenRoom = detectedName;
                     }
+                    context.lastBathRoom = null; // Left bath
                 } else if (isIsland) {
                     if (context.lastKitchenRoom) {
                         context.currentRoom = context.lastKitchenRoom;
@@ -422,23 +439,37 @@ function extractFromChunk(chunk: string, items: CabinetItem[], pageNum: string, 
                         context.currentRoom = "Kitchen 1";
                         context.lastKitchenRoom = "Kitchen 1";
                     }
+                    context.lastBathRoom = null;
                 } else if (isBath) {
                     if (explicitNumberMatch) {
                          context.currentRoom = detectedName;
+                         context.lastBathRoom = detectedName;
                     } else if (detectedName.length > "Bath".length + 4) {
+                         // Specific name like "Master Bath"
                          context.currentRoom = detectedName;
+                         context.lastBathRoom = detectedName;
                     } else {
-                         context.counts.bath++;
-                         context.currentRoom = `Bath ${context.counts.bath}`;
+                         // Generic "Bath" or "Bathroom"
+                         if (context.lastBathRoom) {
+                             // Continuation of previous bath
+                             context.currentRoom = context.lastBathRoom;
+                         } else {
+                             // New generic bath
+                             context.counts.bath++;
+                             context.currentRoom = `Bath ${context.counts.bath}`;
+                             context.lastBathRoom = context.currentRoom;
+                         }
                     }
                     context.lastKitchenRoom = null; // Left kitchen
                 } else if (isLaundry) {
                      context.currentRoom = detectedName.length > 3 ? detectedName : "Laundry";
                      context.lastKitchenRoom = null;
+                     context.lastBathRoom = null;
                 } else {
                     if (detectedName.length > 30) detectedName = "Other Room";
                     context.currentRoom = detectedName;
                     context.lastKitchenRoom = null;
+                    context.lastBathRoom = null;
                 }
                 
                 if (!isSameLineHeader) continue; 

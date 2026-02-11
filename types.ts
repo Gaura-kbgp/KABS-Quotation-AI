@@ -93,14 +93,24 @@ export interface Manufacturer {
 }
 
 export interface PricingLineItem extends CabinetItem {
-  basePrice: number;
-  optionsPrice: number;
-  tierMultiplier: number;
-  finalUnitPrice: number;
-  totalPrice: number;
+  basePrice: number; // This is now treated as LIST PRICE
+  optionsPrice: number; // List Price of options
+  tierMultiplier: number; // Factor derived from Tier (if any)
+  
+  // Cost Side
+  unitCost: number; // (Base + Options) * Factor
+  
+  // Sell Side
+  finalUnitPrice: number; // unitCost / (1 - Margin)
+  totalPrice: number; // finalUnitPrice * Quantity
+  
   tierName: string;
   source: string;
   appliedOptions: { name: string; price: number; sourceSection?: string }[]; 
+  
+  // Audit
+  pricingFactor: number; // The factor used (Global or Room)
+  margin: number; // The margin used
 }
 
 export interface ProjectSpecs {
@@ -153,10 +163,19 @@ export interface ProjectSpecs {
 
 export interface ProjectFinancials {
   taxRate: number; // Percentage (e.g., 7.5 for 7.5%)
-  shippingCost: number; // Fixed Dollar Amount
-  discountRate: number; // Percentage (e.g., 40 for 40% off)
+  shippingCost: number; // Fixed Dollar Amount (Freight)
+  discountRate: number; // Percentage (Legacy - maybe unused now?)
   fuelSurcharge: number; // Fixed Dollar Amount
   miscCharge: number; // Fixed Dollar Amount
+  
+  // New Pricing Logic
+  pricingFactor: number; // Manufacturer Multiplier (e.g. 0.45)
+  roomFactors?: Record<string, number>; // Room overrides
+  
+  globalMargin: number; // Target Margin % (e.g. 35)
+  categoryMargins?: Record<string, number>; // Per-Series/Level margins
+  
+  manufacturerUpcharge?: number; // % Upcharge on List
 }
 
 export interface ContactDetails {
