@@ -268,30 +268,52 @@ function extractFromChunk(chunk: string, items: CabinetItem[], pageNum: string, 
         let potentialHeader = line;
         let isSameLineHeader = false;
         
-        // ... (Keep existing header logic, just skip if line looks like pure code list unless it starts with Room:) ...
-        
         const hasCode = codeRegex.test(line);
         if (hasCode) {
             // Check if the line STARTS with a room name followed by a colon or space
-            const match = line.match(/^((?:Standard|Opt|Optional|Kitchen|Bath|Master|Utility|Laundry|Room|Area|Owners)[^:]*?)(?::|\s{2,}|(?=\s[A-Z0-9]))/i);
+            // Added support for "Kitchen 1", "Kitchen 2", "Unit 1 Kitchen" patterns
+            const match = line.match(/^((?:Unit\s+\d+|Standard|Opt|Optional|Kitchen|Bath|Master|Utility|Laundry|Room|Area|Owners|Powder|Ensuite)[^:]*?)(?::|\s{2,}|(?=\s[A-Z0-9]))/i);
             if (match) {
                 potentialHeader = match[1];
-                if (potentialHeader.length < 50) { // Increased length for "Standard Owners Bath"
+                if (potentialHeader.length < 60) { 
                      isSameLineHeader = true;
                 }
             }
         }
 
-        if ((!hasCode || isSameLineHeader) && potentialHeader.length < 50) {
+        if ((!hasCode || isSameLineHeader) && potentialHeader.length < 60) {
             
             // 1. Explicit "Room:" prefix support
-            const roomPrefixMatch = potentialHeader.match(/^(?:room|area|location)\s*[:\-#]?\s*(.+)/i);
+            const roomPrefixMatch = potentialHeader.match(/^(?:room|area|location|phase|unit)\s*[:\-#]?\s*(.+)/i);
             if (roomPrefixMatch) {
                 let rName = roomPrefixMatch[1].trim();
                 // Clean up weird chars
                 rName = rName.replace(/[:\-]/g, '').trim();
-                if (rName.length > 2 && rName.length < 25) {
+                if (rName.length > 2 && rName.length < 40) {
                     context.currentRoom = rName; // Trust explicit headers
+                    // Reset kitchen context if we switch to an explicit room that might be a kitchen
+                    if (/kitchen/i.test(rName)) {
+                         // Try to extract number
+                         const num = rName.match(/kitchen\s*(\d+)/i);
+                         if (num) {
+                             context.counts.kitchen = parseInt(num[1]);
+                             context.lastKitchenRoom = rName;
+                         } else {
+                             // If it's just "Kitchen" and we already had one, maybe it's a new one?
+                             // But often it's just a header repetition. Keep current count if valid.
+                             if (!context.lastKitchenRoom) {
+                                 context.counts.kitchen = 1;
+                                 context.lastKitchenRoom = "Kitchen 1";
+                                 context.currentRoom = "Kitchen 1";
+                             } else {
+                                 // If the header is exactly "Kitchen", stick to last known.
+                                 // If it's "Kitchen 2", we would have caught it above if explicit.
+                                 context.currentRoom = context.lastKitchenRoom; 
+                             }
+                         }
+                    } else {
+                        context.lastKitchenRoom = null; // Left the kitchen area
+                    }
                     if (!isSameLineHeader) continue;
                 }
             }
@@ -302,16 +324,16 @@ function extractFromChunk(chunk: string, items: CabinetItem[], pageNum: string, 
             const isBath = /\b(bath|bathroom|vanity|ensuite|powder|restroom|owners)\b/i.test(potentialHeader);
             const isLaundry = /\b(laundry|utility|mud)\b/i.test(potentialHeader);
             const isIsland = /\b(island)\b/i.test(potentialHeader);
-            const isOther = /\b(master|living|dining|pantry|bar)\b/i.test(potentialHeader);
+            const isOther = /\b(master|living|dining|pantry|bar|tech|foyer|entry)\b/i.test(potentialHeader);
             
             // Words that suggest this is NOT a header but a description
-            // REMOVED: "option" (conflict with OPT header), "style" (conflict with Standard Style?)
             const ignoredWords = [
                 'cabinet', 'base', 'wall', 'tall', 'filler', 'molding', 'toe', 'kick', 
                 'panel', 'door', 'drawer', 'hinge', 'slide', 'accessory', 'hardware', 
                 'touch', 'kit', 'install', 'glaze', 'paint', 'stain', 'finish', 
                 'upgrade', 'style', 'color', 'spec', 'note', 'adjacent', 
-                'chute', 'basket', 'hamper', 'sink', 'faucet', 'counter', 'top'
+                'chute', 'basket', 'hamper', 'sink', 'faucet', 'counter', 'top',
+                'description', 'qty', 'code', 'price', 'total', 'page'
             ];
             
             // Special Check: "Perimeter" usually implies we are inside a Kitchen, not a new room.
@@ -327,32 +349,68 @@ function extractFromChunk(chunk: string, items: CabinetItem[], pageNum: string, 
             if ((isKitchen || isBath || isLaundry || isIsland || isOther || isPerimeter) && !hasIgnored) {
                 // Ensure it's not just a random word in a sentence
                 const wordCount = potentialHeader.split(/\s+/).length;
-                if (wordCount > 6 && !isExplicitHeader) { 
+                if (wordCount > 8 && !isExplicitHeader) { 
                     if (!isSameLineHeader) continue;
                 } 
 
                 // --- SMART NAME EXTRACTION ---
                 let detectedName = potentialHeader.trim();
-                detectedName = detectedName.replace(/[:\-]+$/, '').trim();
-                detectedName = detectedName.replace(/^\d+[\.\)]\s*/, '');
                 
-                // Fix Casing
-                detectedName = detectedName.replace(/\w\S*/g, (w) => (w.replace(/^\w/, (c) => c.toUpperCase())));
+                // 1. STRONG MATCH EXTRACTION
+                // Instead of trying to clean garbage, extract ONLY what we know is a room name.
+                // This fixes "MIH 4031 MAGNOLIA STD OWNERS BATH GR 1951" -> "OWNERS BATH"
+                const strongRoomRegex = /\b((?:Standard|Opt|Optional|Upgrade|Master|Guest|Owners|Ensuite|Powder|Main|Upper|Lower|Bsmt|Basement)?\s*(?:Kitchen|Bath(?:room)?|Laundry|Pantry|Island|Utility|Mud|Dining|Living|Bed(?:room)?|Study|Office|Garage|Vanity|Bar|Foyer|Entry|Closet|W\.?I\.?C\.?))\b(?:\s*(\d+))?/i;
                 
-                const hasNumber = /\d/.test(detectedName);
+                const strongMatch = detectedName.match(strongRoomRegex);
+                
+                if (strongMatch) {
+                    // Reconstruct from match parts: [FullMatch, NamePrefix+Name, Number]
+                    let coreName = strongMatch[1].trim();
+                    const num = strongMatch[2];
+                    
+                    // Clean up core name casing
+                    coreName = coreName.replace(/\w\S*/g, (w) => (w.replace(/^\w/, (c) => c.toUpperCase())));
+                    
+                    if (num) {
+                        detectedName = `${coreName} ${num}`;
+                    } else {
+                        detectedName = coreName;
+                    }
+                } else {
+                    // Fallback to cleanup logic if no strong keyword found (less likely now due to checks above)
+                    detectedName = detectedName.replace(/[:\-]+$/, '').trim();
+                    detectedName = detectedName.replace(/^\d+[\.\)]\s*/, '');
+                    detectedName = detectedName.replace(/^(OPT|OPTIONAL|STANDARD|UPGRADE)\s+/i, '');
+                    detectedName = detectedName.replace(/\s+(UPPERS|LOWERS|CABINETS|TOPS|BASES|WALLS|VANITIES|OVER|ACROSS|FROM|W\/D|WASHER|DRYER).*$/i, '');
+                    detectedName = detectedName.replace(/\w\S*/g, (w) => (w.replace(/^\w/, (c) => c.toUpperCase())));
+                }
+
+                // Detect Number in Header (e.g. "Kitchen 2", "Bath 3")
+                const explicitNumberMatch = detectedName.match(/(?:Kitchen|Bath|Bathroom|Room)\s*(\d+)/i);
                 
                 if (isPerimeter) {
                     if (context.lastKitchenRoom) {
                          context.currentRoom = context.lastKitchenRoom;
                     }
                 } else if (isKitchen) {
-                    if (hasNumber || detectedName.length > "Kitchen".length + 2) {
-                         context.currentRoom = detectedName;
+                    if (explicitNumberMatch) {
+                         // Explicit "Kitchen 2"
+                         const num = parseInt(explicitNumberMatch[1]);
+                         context.counts.kitchen = num;
+                         context.currentRoom = detectedName; // e.g. "Kitchen 2"
+                         context.lastKitchenRoom = detectedName;
+                    } else if (detectedName.toLowerCase() === "kitchen") {
+                         // Just "Kitchen"
+                         if (!context.lastKitchenRoom) {
+                             context.counts.kitchen = 1;
+                             context.lastKitchenRoom = "Kitchen 1";
+                         }
+                         context.currentRoom = context.lastKitchenRoom || "Kitchen 1";
                     } else {
-                         context.counts.kitchen++;
-                         context.currentRoom = `Kitchen ${context.counts.kitchen}`;
+                         // Something like "Standard Kitchen" or "Gourmet Kitchen"
+                         context.currentRoom = detectedName;
+                         context.lastKitchenRoom = detectedName;
                     }
-                    context.lastKitchenRoom = context.currentRoom;
                 } else if (isIsland) {
                     if (context.lastKitchenRoom) {
                         context.currentRoom = context.lastKitchenRoom;
@@ -362,17 +420,22 @@ function extractFromChunk(chunk: string, items: CabinetItem[], pageNum: string, 
                         context.lastKitchenRoom = "Kitchen 1";
                     }
                 } else if (isBath) {
-                    if (hasNumber || detectedName.length > "Bath".length + 4) {
+                    if (explicitNumberMatch) {
+                         context.currentRoom = detectedName;
+                    } else if (detectedName.length > "Bath".length + 4) {
                          context.currentRoom = detectedName;
                     } else {
                          context.counts.bath++;
                          context.currentRoom = `Bath ${context.counts.bath}`;
                     }
+                    context.lastKitchenRoom = null; // Left kitchen
                 } else if (isLaundry) {
                      context.currentRoom = detectedName.length > 3 ? detectedName : "Laundry";
+                     context.lastKitchenRoom = null;
                 } else {
-                    if (detectedName.length > 25) detectedName = "Other Room";
+                    if (detectedName.length > 30) detectedName = "Other Room";
                     context.currentRoom = detectedName;
+                    context.lastKitchenRoom = null;
                 }
                 
                 if (!isSameLineHeader) continue; 
@@ -397,7 +460,9 @@ function extractFromChunk(chunk: string, items: CabinetItem[], pageNum: string, 
             if (code.match(/^\d{4}/)) continue; // Year like 2024
             if (code.length > 30) continue; // Safety limit
             if (code.includes("PHONE") || code.includes("FAX")) continue;
-            if (["PAGE", "ITEM", "NOTE", "DATE", "TIME", "TOTAL", "SUBTOTAL"].includes(code)) continue;
+            if (["PAGE", "ITEM", "NOTE", "DATE", "TIME", "TOTAL", "SUBTOTAL", "QTY", "PRICE", "AMOUNT"].includes(code)) continue;
+            // Filter out explicit appliance codes/descriptions that might be picked up
+            if (/^(DISHWASHER|MICROWAVE|OVEN|FRIDGE|REFRIGERATOR|RANGE|HOOD|COOKTOP|WASHER|DRYER|APPLIANCE)/i.test(code)) continue;
 
             // Basic Type Inference
             let type: CabinetType = 'Base';
@@ -428,6 +493,14 @@ function extractFromChunk(chunk: string, items: CabinetItem[], pageNum: string, 
                 else if (type === 'Tall') description = `Tall Cabinet ${code.match(/\d+/)?.[0] || ""}"`;
                 else if (type === 'Accessory') description = `Accessory/Part ${code}`;
                 else description = "Cabinet Item";
+            }
+
+            // If we have a code but NO room context yet, default to Kitchen 1.
+            // This prevents "General" bucket for the first set of items if header is missed or implicit.
+            if (!context.currentRoom) {
+                context.currentRoom = "Kitchen 1";
+                context.counts.kitchen = 1;
+                context.lastKitchenRoom = "Kitchen 1";
             }
 
             items.push({

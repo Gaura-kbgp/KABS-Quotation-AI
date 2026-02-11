@@ -296,30 +296,28 @@ export const QuotationFlow: React.FC = () => {
         if (!roomGroups[room]) roomGroups[room] = [];
         roomGroups[room].push(item);
     });
-
-    // Then group by Type within each Room
-    const standardOrder: CabinetType[] = ['Base', 'Wall', 'Tall', 'Filler', 'Panel', 'Accessory', 'Modification'];
     
-    return Object.keys(roomGroups).sort().map(room => {
-        const roomItems = roomGroups[room];
-        const typeGroups: Record<string, T[]> = {};
-        
-        roomItems.forEach(item => {
-            let t = item.type || 'Base';
-            if (!standardOrder.includes(t)) t = 'Accessory';
-            if (!typeGroups[t]) typeGroups[t] = [];
-            typeGroups[t].push(item);
+    // Flatten logic: Return { room, items: [...] } sorted by type/name
+    // Remove .sort() on keys to preserve PDF order (mostly)
+    return Object.keys(roomGroups).map(room => {
+        const roomItems = roomGroups[room].sort((a, b) => {
+             // Sort by type priority first, then original code
+             const typeOrder = ['Base', 'Wall', 'Tall', 'Accessory'];
+             const idxA = typeOrder.indexOf(a.type || 'Base');
+             const idxB = typeOrder.indexOf(b.type || 'Base');
+             if (idxA !== idxB) return idxA - idxB;
+             return (a.originalCode || '').localeCompare(b.originalCode || '');
         });
-        
-        const categories = standardOrder
-            .filter(t => typeGroups[t] && typeGroups[t].length > 0)
-            .map(t => ({ 
-                type: t, 
-                items: typeGroups[t],
-                totalQty: typeGroups[t].reduce((sum, i) => sum + i.quantity, 0)
-            }));
-            
-        return { room, categories };
+
+        // We wrap it in a single "category" called "All Items" to maintain compatibility with the rendering loop
+        // or we refactor the rendering loop. 
+        // Refactoring rendering loop is cleaner but riskier. 
+        // Let's change the return type to flat items and update the rendering loop.
+        return { 
+            room, 
+            items: roomItems,
+            totalQty: roomItems.reduce((sum, i) => sum + i.quantity, 0)
+        };
     });
   };
 
@@ -1088,87 +1086,79 @@ export const QuotationFlow: React.FC = () => {
                 <div className="overflow-hidden border border-slate-200 rounded-lg">
                     <table className="min-w-full divide-y divide-slate-200">
                          <thead className="bg-slate-100"><tr><th className="px-6 py-3 text-left text-xs font-bold text-slate-500 uppercase">Item Description</th><th className="px-6 py-3 text-left text-xs font-bold text-slate-500 uppercase">PDF Code (Editable)</th><th className="px-6 py-3 text-left text-xs font-bold text-brand-600 uppercase">Normalized</th><th className="px-6 py-3 text-center text-xs font-bold text-slate-500 uppercase">Qty (Editable)</th><th className="px-4 py-3 text-right text-xs font-bold text-slate-500 uppercase">Action</th></tr></thead>
-                         <tbody className="divide-y divide-slate-100 bg-white">
-                            {groupedReviewItems.map(roomGroup => (
-    <React.Fragment key={roomGroup.room}>
-        <tr className="bg-slate-100 border-t-2 border-slate-200">
-            <td colSpan={5} className="px-6 py-3 font-bold text-sm text-slate-800 uppercase tracking-wider">
-                <div className="flex items-center gap-2">
-                    <span className="bg-slate-300 text-slate-700 px-2 py-0.5 rounded text-xs">ROOM</span>
-                    <DebouncedInput 
-                        value={roomGroup.room} 
-                        onChange={(val: string) => handleRenameRoom(roomGroup.room, val)} 
-                        className="font-bold bg-transparent border-b border-dashed border-slate-400 focus:border-brand-500 outline-none text-slate-800 min-w-[200px]"
-                    />
-                </div>
-            </td>
-        </tr>
-        {roomGroup.categories.map(cat => (
-            <React.Fragment key={cat.type}>
-                <tr className="bg-slate-50">
-                    <td colSpan={5} className="px-6 py-2 font-bold text-xs text-slate-600 uppercase tracking-wider pl-12 border-l-4 border-l-brand-500">
-                        {cat.type} Cabinets ({cat.totalQty})
-                    </td>
-                </tr>
-                {cat.items.map(item => (
-                    <tr key={item.id} className="hover:bg-blue-50 group border-b border-slate-100">
-                        <td className="px-6 py-3 text-sm text-slate-900 pl-12">
-                            <DebouncedInput 
-                                className="w-full bg-transparent border-none focus:bg-white focus:ring-1 focus:ring-brand-500 px-1 py-0.5" 
-                                value={item.description} 
-                                onChange={(val: string) => updateProjectItem(item.id, { description: val })}
-                            />
-                            <div className="text-xs text-slate-400 mt-0.5">
-                                {item.width > 0 && `${item.width}" W x `}{item.height}" H x {item.depth}" D
-                            </div>
-                            {item.modifications && item.modifications.length > 0 && (
-                                <div className="mt-1 pl-2 border-l-2 border-slate-200 text-xs text-slate-500">
-                                    {item.modifications.map((m, i) => (<div key={i}>+ {m.description}</div>))}
-                                </div>
-                            )}
-                        </td>
-                        <td className="px-6 py-3 text-sm text-slate-500 font-mono">
-                            <DebouncedInput 
-                                className="w-full bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5 font-bold text-slate-800" 
-                                value={item.originalCode} 
-                                onChange={(val: string) => updateProjectItem(item.id, { originalCode: val.toUpperCase() })}
-                            />
-                        </td>
-                        <td className="px-6 py-3 text-sm text-brand-700 font-bold font-mono">
-                            {item.normalizedCode || item.originalCode}
-                        </td>
-                        <td className="px-6 py-3 text-center font-medium">
-                            <DebouncedInput 
-                                type="number" 
-                                className="w-16 text-center bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5" 
-                                value={item.quantity} 
-                                onChange={(val: number) => updateProjectItem(item.id, { quantity: val || 0 })}
-                            />
-                        </td>
-                        <td className="px-4 py-3 text-right">
-                            <button 
-                                type="button" 
-                                onClick={() => deleteProjectItem(item.id)} 
-                                className="p-1.5 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded transition-colors" 
-                                title="Remove Item"
-                            >
-                                <Trash2 className="w-4 h-4"/>
-                            </button>
-                        </td>
-                    </tr>
-                ))}
-                <tr className="bg-white">
-                    <td colSpan={5} className="px-6 py-2 pl-12">
-                         <Button variant="ghost" size="sm" onClick={() => handleAddItem(roomGroup.room, cat.type as CabinetType)} className="text-brand-600 hover:text-brand-700 hover:bg-brand-50 text-xs flex items-center gap-1">
-                             <Plus className="w-3 h-3" /> Add {cat.type}
-                         </Button>
-                    </td>
-                </tr>
-            </React.Fragment>
-        ))}
-    </React.Fragment>
+                <tbody className="divide-y divide-slate-100 bg-white">
+                           {groupedReviewItems.map(roomGroup => (
+   <React.Fragment key={roomGroup.room}>
+       <tr className="bg-slate-100 border-t-2 border-slate-200">
+           <td colSpan={5} className="px-6 py-3 font-bold text-sm text-slate-800 uppercase tracking-wider">
+               <div className="flex items-center gap-2">
+                   <span className="bg-slate-300 text-slate-700 px-2 py-0.5 rounded text-xs">ROOM</span>
+                   <DebouncedInput 
+                       value={roomGroup.room} 
+                       onChange={(val: string) => handleRenameRoom(roomGroup.room, val)} 
+                       className="font-bold bg-transparent border-b border-dashed border-slate-400 focus:border-brand-500 outline-none text-slate-800 min-w-[200px]"
+                   />
+                   <span className="text-xs text-slate-500 ml-2">({roomGroup.totalQty} items)</span>
+               </div>
+           </td>
+       </tr>
+               {roomGroup.items.map(item => (
+                   <tr key={item.id} className="hover:bg-blue-50 group border-b border-slate-100">
+                       <td className="px-6 py-3 text-sm text-slate-900 pl-12">
+                           <DebouncedInput 
+                               className="w-full bg-transparent border-none focus:bg-white focus:ring-1 focus:ring-brand-500 px-1 py-0.5" 
+                               value={item.description} 
+                               onChange={(val: string) => updateProjectItem(item.id, { description: val })}
+                           />
+                           <div className="text-xs text-slate-400 mt-0.5">
+                               {item.width > 0 && `${item.width}" W x `}{item.height}" H x {item.depth}" D
+                           </div>
+                           {item.modifications && item.modifications.length > 0 && (
+                               <div className="mt-1 pl-2 border-l-2 border-slate-200 text-xs text-slate-500">
+                                   {item.modifications.map((m, i) => (<div key={i}>+ {m.description}</div>))}
+                               </div>
+                           )}
+                       </td>
+                       <td className="px-6 py-3 text-sm text-slate-500 font-mono">
+                           <DebouncedInput 
+                               className="w-full bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5 font-bold text-slate-800" 
+                               value={item.originalCode} 
+                               onChange={(val: string) => updateProjectItem(item.id, { originalCode: val.toUpperCase() })}
+                           />
+                       </td>
+                       <td className="px-6 py-3 text-sm text-brand-700 font-bold font-mono">
+                           {item.normalizedCode || item.originalCode}
+                       </td>
+                       <td className="px-6 py-3 text-center font-medium">
+                           <DebouncedInput 
+                               type="number" 
+                               className="w-16 text-center bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5" 
+                               value={item.quantity} 
+                               onChange={(val: number) => updateProjectItem(item.id, { quantity: val || 0 })}
+                           />
+                       </td>
+                       <td className="px-4 py-3 text-right">
+                           <button 
+                               type="button" 
+                               onClick={() => deleteProjectItem(item.id)} 
+                               className="p-1.5 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded transition-colors" 
+                               title="Remove Item"
+                           >
+                               <Trash2 className="w-4 h-4"/>
+                           </button>
+                       </td>
+                   </tr>
+               ))}
+               <tr className="bg-white">
+                   <td colSpan={5} className="px-6 py-2 pl-12">
+                        <Button variant="ghost" size="sm" onClick={() => handleAddItem(roomGroup.room, 'Base')} className="text-brand-600 hover:text-brand-700 hover:bg-brand-50 text-xs flex items-center gap-1">
+                            <Plus className="w-3 h-3" /> Add Item to {roomGroup.room}
+                        </Button>
+                   </td>
+               </tr>
+   </React.Fragment>
 ))}
-                         </tbody>
+                        </tbody>
                     </table>
                 </div>
              </div>
