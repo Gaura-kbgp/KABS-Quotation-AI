@@ -98,6 +98,7 @@ export const QuotationFlow: React.FC = () => {
   const [isConnecting, setIsConnecting] = useState<string | null>(null);
   const [catalogCategoryFilter, setCatalogCategoryFilter] = useState<string>(''); // NEW: Catalog Filter
   const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set()); // NEW: Multi-selection State
+  const [toastMessage, setToastMessage] = useState<string | null>(null); // NEW: Toast Notification
 
   // Financial State Local (synced with project)
   const [financials, setFinancials] = useState<ProjectFinancials>({
@@ -150,6 +151,13 @@ export const QuotationFlow: React.FC = () => {
           setDeliveryDetails({ ...customerDetails });
       }
   }, [customerDetails.name]); // Only trigger once on name change start
+
+  useEffect(() => {
+      if (toastMessage) {
+          const timer = setTimeout(() => setToastMessage(null), 3000);
+          return () => clearTimeout(timer);
+      }
+  }, [toastMessage]);
 
   const updateProject = async (updates: Partial<Project>) => {
     if (!project) return;
@@ -236,7 +244,7 @@ export const QuotationFlow: React.FC = () => {
       const desc = typeof initialSku === 'string' ? 'Added from Catalog' : 'Manual Entry';
 
       const newItem: PricingLineItem = {
-          id: crypto.randomUUID(),
+          id: `manual_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
           originalCode: code,
           normalizedCode: code,
           description: desc,
@@ -256,7 +264,8 @@ export const QuotationFlow: React.FC = () => {
           appliedOptions: [],
           unitCost: 0,
           pricingFactor: financials.pricingFactor,
-          margin: financials.globalMargin
+          margin: financials.globalMargin,
+          isManual: true
       };
 
       const newItems = [...project.items, newItem];
@@ -358,8 +367,14 @@ export const QuotationFlow: React.FC = () => {
     // Remove .sort() on keys to preserve PDF order (mostly)
     return Object.keys(roomGroups).map(room => {
         const roomItems = roomGroups[room].sort((a, b) => {
+             // Force Manual Entries to bottom
+             const isManualA = a.isManual || a.description === 'Manual Entry' || a.originalCode === 'NEW ITEM';
+             const isManualB = b.isManual || b.description === 'Manual Entry' || b.originalCode === 'NEW ITEM';
+             if (isManualA && !isManualB) return 1;
+             if (!isManualA && isManualB) return -1;
+
              // Sort by type priority first, then original code
-             const typeOrder = ['Base', 'Wall', 'Tall', 'Accessory'];
+             const typeOrder = ['Base', 'Wall', 'Tall', 'Appliance', 'Accessory', 'Hardware', 'Finishing', 'Modification'];
              const idxA = typeOrder.indexOf(a.type || 'Base');
              const idxB = typeOrder.indexOf(b.type || 'Base');
              if (idxA !== idxB) return idxA - idxB;
@@ -368,14 +383,30 @@ export const QuotationFlow: React.FC = () => {
 
         // We wrap it in a single "category" called "All Items" to maintain compatibility with the rendering loop
         // or we refactor the rendering loop. 
-        // Refactoring rendering loop is cleaner but riskier. 
         // Let's change the return type to flat items and update the rendering loop.
         return { 
             room, 
             items: roomItems,
             totalQty: roomItems.reduce((sum, i) => sum + i.quantity, 0)
         };
+    }).sort((a, b) => {
+        // Custom Room Sorting: Kitchens first, then Baths, then others, Hardware/Finishing last
+        const typeA = getRoomTypeScore(a.room);
+        const typeB = getRoomTypeScore(b.room);
+        
+        if (typeA !== typeB) return typeA - typeB;
+        return a.room.localeCompare(b.room);
     });
+  };
+
+  const getRoomTypeScore = (roomName: string) => {
+      const lower = roomName.toLowerCase();
+      if (lower.includes('kitchen')) return 1;
+      if (lower.includes('pantry')) return 2;
+      if (lower.includes('bath') || lower.includes('master') || lower.includes('ensuite') || lower.includes('powder')) return 3;
+      if (lower.includes('laundry') || lower.includes('utility')) return 4;
+      if (lower.includes('hardware') || lower.includes('finishing') || lower.includes('accessories')) return 99;
+      return 10; // Other rooms
   };
 
   const handleAddItem = (room: string, type: CabinetType) => {
@@ -389,10 +420,12 @@ export const QuotationFlow: React.FC = () => {
           width: 0, height: 0, depth: 0,
           normalizedCode: "NEW ITEM",
           room: room,
+          isManual: true,
           notes: "Manual Entry"
       };
       const newItems = [...project.items, newItem];
       updateProject({ items: newItems });
+      setToastMessage("New manual entry added");
   };
 
   const handleRenameRoom = (oldName: string, newName: string) => {
@@ -405,7 +438,19 @@ export const QuotationFlow: React.FC = () => {
           }
           return item;
       });
-      updateProject({ items: newItems });
+
+      // Also update pricing items
+      let newPricing = project.pricing;
+      if (project.pricing) {
+          newPricing = project.pricing.map(item => {
+              if ((item.room || "General") === oldName) {
+                  return { ...item, room: newName };
+              }
+              return item;
+          });
+      }
+
+      updateProject({ items: newItems, pricing: newPricing });
   };
 
   const handleAddRoom = () => {
@@ -413,7 +458,7 @@ export const QuotationFlow: React.FC = () => {
       const roomName = window.prompt("Enter new room name (e.g., 'Kitchen 2', 'Basement Bar'):");
       if (!roomName || roomName.trim() === "") return;
       
-      const newItem: CabinetItem = {
+      const newItem: PricingLineItem = {
           id: `manual_${Date.now()}`,
           originalCode: "NOTE",
           quantity: 1,
@@ -422,11 +467,26 @@ export const QuotationFlow: React.FC = () => {
           width: 0, height: 0, depth: 0,
           normalizedCode: "NOTE",
           room: roomName.trim(),
-          notes: "Initial Item"
+          notes: "Initial Item",
+          
+          // Pricing fields (Required for PricingLineItem)
+          basePrice: 0,
+          optionsPrice: 0,
+          tierMultiplier: 1,
+          finalUnitPrice: 0,
+          totalPrice: 0,
+          tierName: project.selectedTierId || 'Default',
+          source: 'System',
+          appliedOptions: [],
+          unitCost: 0,
+          pricingFactor: financials.pricingFactor,
+          margin: financials.globalMargin
       };
       
       const newItems = [...project.items, newItem];
-      updateProject({ items: newItems });
+      const newPricing = project.pricing ? [...project.pricing, newItem] : [newItem];
+      
+      updateProject({ items: newItems, pricing: newPricing });
   };
 
   const toggleSelection = (id: string) => {
@@ -505,10 +565,14 @@ export const QuotationFlow: React.FC = () => {
     // --- HEADER ---
     doc.setFontSize(28);
     doc.setFont("times", "italic");
-    doc.text("Midland", 45, 20);
+    const mfgName = s.manufacturer || "Cabinet Proposal";
+    doc.text(mfgName, 45, 20);
+    
     doc.setFontSize(9);
     doc.setFont("helvetica", "normal");
-    doc.text("A Division of Koch Cabinets", 47, 25);
+    if (mfgName.toLowerCase().includes('midland')) {
+        doc.text("A Division of Koch Cabinets", 47, 25);
+    }
 
     doc.setFontSize(16);
     doc.setFont("helvetica", "bold");
@@ -518,10 +582,13 @@ export const QuotationFlow: React.FC = () => {
     doc.setFont("helvetica", "normal");
     const headerX = 170;
     let headerY = 24;
-    doc.text("111 North 1St. St.", headerX, headerY, { align: 'right' }); headerY += 4;
-    doc.text("Seneca KS, 66538", headerX, headerY, { align: 'right' }); headerY += 4;
-    doc.text("Phone: 877-540-5624", headerX, headerY, { align: 'right' }); headerY += 4;
-    doc.text("Email: orders@kochcabinet.com", headerX, headerY, { align: 'right' });
+    
+    if (mfgName.toLowerCase().includes('midland') || mfgName.toLowerCase().includes('koch')) {
+        doc.text("111 North 1St. St.", headerX, headerY, { align: 'right' }); headerY += 4;
+        doc.text("Seneca KS, 66538", headerX, headerY, { align: 'right' }); headerY += 4;
+        doc.text("Phone: 877-540-5624", headerX, headerY, { align: 'right' }); headerY += 4;
+        doc.text("Email: orders@kochcabinet.com", headerX, headerY, { align: 'right' });
+    }
 
     // --- DEALER INFO ---
     let yPos = 45;
@@ -608,7 +675,7 @@ export const QuotationFlow: React.FC = () => {
     const c3 = leftMargin + 125; const v3 = c3 + 25;
 
     // Row 1
-    doc.text("Cabinet Line:", c1, sY); doc.text(s.lineType || "Midland", v1, sY);
+    doc.text("Cabinet Line:", c1, sY); doc.text(s.lineType || s.manufacturer || "Standard", v1, sY);
     doc.text("Cardboard Boxed:", c2, sY); doc.text(s.cardboardBoxed || "No", v2, sY);
     doc.text("Wall/Base Door:", c3, sY); doc.text(`${s.wallDoorStyle || 'Pioneer'}`, v3, sY);
     sY += sInc;
@@ -648,8 +715,14 @@ export const QuotationFlow: React.FC = () => {
     yPos += 6 + specsBoxH + 4;
 
     // --- GROUPED ITEMS LOGIC ---
+    // 1. Separate Items by Category for PDF
+    const cabinetItems = validItems.filter(i => !['Appliance', 'Hardware', 'Finishing'].includes(i.type));
+    const hardwareItems = validItems.filter(i => i.type === 'Hardware');
+    const finishingItems = validItems.filter(i => i.type === 'Finishing');
+    const applianceItems = validItems.filter(i => i.type === 'Appliance');
+
     const roomGroups: Record<string, PricingLineItem[]> = {};
-    validItems.forEach(item => {
+    cabinetItems.forEach(item => {
         const room = item.room || "General / Additional Items";
         if (!roomGroups[room]) roomGroups[room] = [];
         roomGroups[room].push(item);
@@ -659,22 +732,29 @@ export const QuotationFlow: React.FC = () => {
          // --- SUMMARY TABLE ---
          const summaryBody: any[] = [];
          
+         // Cabinets by Room
          Object.entries(roomGroups).forEach(([roomName, items]) => {
              const roomTotal = items.reduce((sum, i) => sum + i.totalPrice, 0);
              const itemCount = items.reduce((sum, i) => sum + i.quantity, 0);
-             const desc = `Cabinetry, Moldings & Accessories - ${s.wallDoorStyle || 'Standard'}`;
-             
-             summaryBody.push([
-                 roomName,
-                 desc,
-                 `${itemCount} items`,
-                 `$${roomTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}`
-             ]);
+             const desc = `Cabinetry - ${s.wallDoorStyle || 'Standard'}`;
+             summaryBody.push([roomName, desc, `${itemCount} items`, `$${roomTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}`]);
          });
+
+         // Hardware Summary
+         if (hardwareItems.length > 0) {
+             const hwTotal = hardwareItems.reduce((sum, i) => sum + i.totalPrice, 0);
+             summaryBody.push(['Hardware', 'Hinges, Glides & Mechanisms', `${hardwareItems.length} items`, `$${hwTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}`]);
+         }
+
+         // Finishing Summary
+         if (finishingItems.length > 0) {
+             const finTotal = finishingItems.reduce((sum, i) => sum + i.totalPrice, 0);
+             summaryBody.push(['Finishing', 'Touch Up, Paint & Fillers', `${finishingItems.length} items`, `$${finTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}`]);
+         }
          
          autoTable(doc, {
             startY: yPos,
-            head: [['Room / Area', 'Description', 'Quantity', 'Total Price']],
+            head: [['Area / Category', 'Description', 'Quantity', 'Total Price']],
             body: summaryBody,
             theme: 'plain',
             styles: { fontSize: 9, cellPadding: 3, lineColor: [200, 200, 200], lineWidth: 0.1, valign: 'middle' },
@@ -691,25 +771,28 @@ export const QuotationFlow: React.FC = () => {
          yPos = (doc as any).lastAutoTable.finalY + 10;
 
     } else {
-        //Start printing tables per room
-        Object.entries(roomGroups).forEach(([roomName, items]) => {
-            // Check for page break if close to bottom
+        // --- DETAILED TABLES ---
+        
+        // Helper to print a table for a group of items
+        const printTable = (title: string, items: PricingLineItem[], headerColor: [number, number, number] = [240, 240, 240]) => {
+            if (items.length === 0) return;
+
+            // Check for page break
             if (yPos > doc.internal.pageSize.getHeight() - 40) {
                 doc.addPage();
                 yPos = 20;
             }
 
-            // Room Header
-            doc.setFillColor(240, 240, 240); // Slightly lighter gray for room header
+            // Header
+            doc.setFillColor(...headerColor);
             doc.rect(leftMargin, yPos, boxWidth, 7, 'F');
             doc.setFont("helvetica", "bold");
             doc.setFontSize(10);
             doc.setTextColor(0);
-            doc.text(`${roomName}`, leftMargin + 2, yPos + 5);
-            
+            doc.text(title, leftMargin + 2, yPos + 5);
             yPos += 7;
 
-            // Table Body
+            // Body
             const tableBody: any[] = [];
             items.forEach((item, index) => {
                 const itemNum = index + 1;
@@ -724,33 +807,20 @@ export const QuotationFlow: React.FC = () => {
                     desc,
                     `$${item.totalPrice.toLocaleString(undefined, {minimumFractionDigits: 2})}`
                 ]);
-
+                
+                // Modifications & Options logic...
                 if (item.modifications) {
                     item.modifications.forEach((mod) => {
-                        tableBody.push([
-                            ``,
-                            '',
-                            mod.description.includes('FINISH END') ? (mod.description.includes('Left') ? 'FEL' : 'FER') : 'MOD',
-                            `${mod.description}`,
-                            `$${(mod.price || 0).toFixed(2)}`
-                        ]);
+                        tableBody.push(['', '', mod.description.includes('FINISH END') ? (mod.description.includes('Left') ? 'FEL' : 'FER') : 'MOD', `${mod.description}`, `$${(mod.price || 0).toFixed(2)}`]);
                     });
                 }
-                
                 if (item.appliedOptions) {
                     item.appliedOptions.forEach((opt) => {
-                        tableBody.push([
-                            ``,
-                            '',
-                            'OPT',
-                            `${opt.name}`,
-                            `$${opt.price.toFixed(2)}`
-                        ]);
+                        tableBody.push(['', '', 'OPT', `${opt.name}`, `$${opt.price.toFixed(2)}`]);
                     });
                 }
             });
 
-            // AutoTable for this room
             autoTable(doc, {
                 startY: yPos,
                 head: [['Item', 'Qty.', 'Product Code', 'Description', 'Price']],
@@ -777,24 +847,37 @@ export const QuotationFlow: React.FC = () => {
                 }
             });
 
-            // Update yPos for next iteration
             yPos = (doc as any).lastAutoTable.finalY + 2;
 
-            // Room Subtotal
-            const roomTotal = items.reduce((sum, i) => sum + i.totalPrice, 0);
-            
-            // Prevent page break split of subtotal
+            // Subtotal
+            const total = items.reduce((sum, i) => sum + i.totalPrice, 0);
             if (yPos > doc.internal.pageSize.getHeight() - 15) {
                 doc.addPage();
                 yPos = 20;
             }
-
             doc.setFontSize(9);
             doc.setFont("helvetica", "bold");
-            doc.text(`${roomName} Total: $${roomTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}`, 196 - 14, yPos + 5, { align: 'right' });
-            
-            yPos += 12; // Gap before next room
+            doc.text(`${title} Total: $${total.toLocaleString(undefined, {minimumFractionDigits: 2})}`, 196 - 14, yPos + 5, { align: 'right' });
+            yPos += 12;
+        };
+
+        // 1. Cabinet Rooms
+        Object.entries(roomGroups).forEach(([roomName, items]) => {
+            printTable(roomName, items);
         });
+
+        // 2. Hardware Section
+        if (hardwareItems.length > 0) {
+            printTable("Hardware & Mechanisms", hardwareItems, [255, 237, 213]); // Orange-ish header
+        }
+
+        // 3. Finishing Section
+        if (finishingItems.length > 0) {
+            printTable("Finishing & Touch Up", finishingItems, [243, 232, 255]); // Purple-ish header
+        }
+        
+        // 4. Appliances (Optional - usually not priced, but if we wanted to show them...)
+        // We typically exclude them from the formal quote unless they have prices.
     }
 
     // --- TOTALS ---
@@ -1003,7 +1086,7 @@ export const QuotationFlow: React.FC = () => {
         manufacturer: mfg.name,
         priceGroup: mfg.tiers[0]?.name || 'Standard',
         seriesName: defaultSeries,
-        lineType: 'Midland', // Default preference
+        lineType: mfg.name, // Default preference
         cardboardBoxed: 'No',
         softCloseHinges: 'Yes',
         glaze: 'None',
@@ -1401,6 +1484,14 @@ export const QuotationFlow: React.FC = () => {
                         </button>
                     </div>
                 )}
+
+                {/* Toast Notification */}
+                {toastMessage && (
+                    <div className="fixed bottom-6 right-6 bg-slate-900 text-white px-6 py-3 rounded-lg shadow-lg flex items-center gap-3 animate-in slide-in-from-bottom-4 z-50">
+                        <CheckCircle2 className="w-5 h-5 text-green-400" />
+                        <span className="font-medium text-sm">{toastMessage}</span>
+                    </div>
+                )}
              </div>
         )}
         {step === 2 && (
@@ -1559,30 +1650,42 @@ export const QuotationFlow: React.FC = () => {
 
                         {(() => {
                             // 1. Separate Items by Category
-                            const cabinetItems = project.pricing.filter(i => i.type !== 'Appliance' && i.type !== 'Hardware');
+                            // Cabinet Items: Everything NOT Hardware, Finishing, or Appliance
+                            const cabinetItems = project.pricing.filter(i => !['Appliance', 'Hardware', 'Finishing'].includes(i.type));
+                            
+                            // Hardware: Hinges, Glides, etc.
                             const hardwareItems = project.pricing.filter(i => i.type === 'Hardware');
+                            
+                            // Finishing: Touch Up, Putty, Paint, Stain, etc.
+                            const finishingItems = project.pricing.filter(i => i.type === 'Finishing');
+                            
+                            // Appliances: Excluded
                             const applianceItems = project.pricing.filter(i => i.type === 'Appliance');
 
                             // 2. Group Cabinets by Room
+                            // Default to "General" only if Room is missing
                             const groups: Record<string, PricingLineItem[]> = {};
                             cabinetItems.forEach(item => {
-                                const room = item.room || "General";
+                                let room = item.room || "General";
+                                // Clean up room names if needed (e.g. "Kitchen 1" vs "Kitchen")
+                                if (room.toLowerCase() === 'unknown') room = "General";
+                                
                                 if (!groups[room]) groups[room] = [];
                                 groups[room].push(item);
                             });
 
                             // 3. Render Cabinet Groups
                             const cabinetSections = Object.entries(groups).map(([roomName, items]) => (
-                                <div key={roomName} className="mb-8 border border-slate-200 rounded-lg overflow-hidden">
+                                <div key={roomName} className="mb-8 border border-slate-200 rounded-lg overflow-hidden shadow-sm">
                                     <div className="bg-slate-100 px-4 py-3 border-b border-slate-200 flex justify-between items-center">
                                         <div className="flex items-center gap-4">
                                             <div className="flex items-center gap-2">
-                                                <Layers className="w-4 h-4 text-slate-500" />
-                                                <h3 className="font-bold text-slate-800">{roomName}</h3>
-                                                <span className="bg-slate-200 text-slate-600 px-2 py-0.5 rounded-full text-xs font-medium">{items.length} items</span>
+                                                <Layers className="w-5 h-5 text-brand-600" />
+                                                <h3 className="font-bold text-lg text-slate-800">{roomName}</h3>
+                                                <span className="bg-white border border-slate-200 text-slate-600 px-2 py-0.5 rounded-full text-xs font-medium">{items.length} items</span>
                                             </div>
                                             <div className="flex items-center gap-2 text-xs">
-                                                <span className="text-slate-400">Factor:</span>
+                                                <span className="text-slate-400 font-medium uppercase tracking-wide">Markup Factor:</span>
                                                 <DebouncedInput
                                                     type="number"
                                                     step="0.01"
@@ -1596,16 +1699,17 @@ export const QuotationFlow: React.FC = () => {
                                                 />
                                             </div>
                                         </div>
-                                        <span className="text-sm font-bold text-slate-700">
-                                            Subtotal: <span className="text-slate-900">${items.reduce((acc, i) => acc + i.totalPrice, 0).toLocaleString()}</span>
-                                        </span>
+                                        <div className="text-right">
+                                            <div className="text-[10px] text-slate-400 uppercase font-bold tracking-wider">Subtotal</div>
+                                            <div className="text-lg font-bold text-slate-900">${items.reduce((acc, i) => acc + i.totalPrice, 0).toLocaleString()}</div>
+                                        </div>
                                     </div>
                                     
                                     <table className="min-w-full divide-y divide-slate-200">
                                         <thead className="bg-slate-50 text-slate-500">
                                             <tr>
                                                 <th className="px-4 py-2 text-left text-xs font-bold uppercase tracking-wider">#</th>
-                                                <th className="px-4 py-2 text-left text-xs font-bold uppercase tracking-wider">Cab Code</th>
+                                                <th className="px-4 py-2 text-left text-xs font-bold uppercase tracking-wider">Code</th>
                                                 <th className="px-4 py-2 text-left text-xs font-bold uppercase tracking-wider">Description</th>
                                                 <th className="px-4 py-2 text-center text-xs font-bold uppercase tracking-wider">Qty</th>
                                                 <th className="px-4 py-2 text-right text-xs font-bold uppercase tracking-wider">Unit Price</th>
@@ -1671,24 +1775,23 @@ export const QuotationFlow: React.FC = () => {
                                 </div>
                             ));
 
-                            // 4. Render Hardware Section (if any)
+                            // 4. Render Hardware Section
                             const hardwareSection = hardwareItems.length > 0 ? (
-                                <div key="hardware-section" className="mb-8 border border-orange-200 rounded-lg overflow-hidden">
+                                <div key="hardware-section" className="mb-8 border border-orange-200 rounded-lg overflow-hidden shadow-sm">
                                     <div className="bg-orange-50 px-4 py-3 border-b border-orange-200 flex justify-between items-center">
                                         <div className="flex items-center gap-2">
-                                            <Hammer className="w-4 h-4 text-orange-600" />
-                                            <h3 className="font-bold text-orange-900">Hardware & Accessories</h3>
-                                            <span className="bg-orange-200 text-orange-800 px-2 py-0.5 rounded-full text-xs font-medium">{hardwareItems.length} items</span>
+                                            <Hammer className="w-5 h-5 text-orange-600" />
+                                            <h3 className="font-bold text-lg text-orange-900">Hardware & Mechanisms</h3>
+                                            <span className="bg-orange-100 text-orange-800 px-2 py-0.5 rounded-full text-xs font-medium">{hardwareItems.length} items</span>
                                         </div>
                                         <span className="text-sm font-bold text-orange-900">
-                                            Subtotal: <span className="text-orange-950">${hardwareItems.reduce((acc, i) => acc + i.totalPrice, 0).toLocaleString()}</span>
+                                            Subtotal: <span className="text-lg text-orange-950">${hardwareItems.reduce((acc, i) => acc + i.totalPrice, 0).toLocaleString()}</span>
                                         </span>
                                     </div>
                                     <table className="min-w-full divide-y divide-orange-100">
-                                         {/* Simplified Table for Hardware */}
-                                         <thead className="bg-orange-50/50 text-orange-500">
+                                        <thead className="bg-orange-50/50 text-orange-500">
                                             <tr>
-                                                <th className="px-4 py-2 text-left text-xs font-bold uppercase">Item</th>
+                                                <th className="px-4 py-2 text-left text-xs font-bold uppercase">Item / Description</th>
                                                 <th className="px-4 py-2 text-center text-xs font-bold uppercase">Qty</th>
                                                 <th className="px-4 py-2 text-right text-xs font-bold uppercase">Price</th>
                                                 <th className="px-4 py-2 text-right text-xs font-bold uppercase">Total</th>
@@ -1712,7 +1815,47 @@ export const QuotationFlow: React.FC = () => {
                                 </div>
                             ) : null;
 
-                            // 5. Render Appliances Section (Excluded Items)
+                            // 5. Render Finishing Section (NEW)
+                            const finishingSection = finishingItems.length > 0 ? (
+                                <div key="finishing-section" className="mb-8 border border-purple-200 rounded-lg overflow-hidden shadow-sm">
+                                    <div className="bg-purple-50 px-4 py-3 border-b border-purple-200 flex justify-between items-center">
+                                        <div className="flex items-center gap-2">
+                                            <div className="p-1 bg-purple-100 rounded text-purple-600"><PaintBucket className="w-4 h-4" /></div>
+                                            <h3 className="font-bold text-lg text-purple-900">Finishing & Touch Up</h3>
+                                            <span className="bg-purple-100 text-purple-800 px-2 py-0.5 rounded-full text-xs font-medium">{finishingItems.length} items</span>
+                                        </div>
+                                        <span className="text-sm font-bold text-purple-900">
+                                            Subtotal: <span className="text-lg text-purple-950">${finishingItems.reduce((acc, i) => acc + i.totalPrice, 0).toLocaleString()}</span>
+                                        </span>
+                                    </div>
+                                    <table className="min-w-full divide-y divide-purple-100">
+                                        <thead className="bg-purple-50/50 text-purple-500">
+                                            <tr>
+                                                <th className="px-4 py-2 text-left text-xs font-bold uppercase">Item / Description</th>
+                                                <th className="px-4 py-2 text-center text-xs font-bold uppercase">Qty</th>
+                                                <th className="px-4 py-2 text-right text-xs font-bold uppercase">Price</th>
+                                                <th className="px-4 py-2 text-right text-xs font-bold uppercase">Total</th>
+                                                <th className="px-4 py-2 w-10"></th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="bg-white divide-y divide-purple-50">
+                                            {finishingItems.map((item, index) => (
+                                                <tr key={item.id}>
+                                                    <td className="px-4 py-2 text-sm text-slate-800 font-medium">{item.description} <span className="text-xs text-slate-400">({item.originalCode})</span></td>
+                                                    <td className="px-4 py-2 text-center text-sm">{item.quantity}</td>
+                                                    <td className="px-4 py-2 text-right text-sm">${item.finalUnitPrice.toLocaleString()}</td>
+                                                    <td className="px-4 py-2 text-right text-sm font-bold">${item.totalPrice.toLocaleString()}</td>
+                                                    <td className="px-4 py-2 text-center">
+                                                        <button onClick={() => deleteProjectItem(item.id)} className="text-slate-400 hover:text-red-500"><Trash2 className="w-3 h-3"/></button>
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            ) : null;
+
+                            // 6. Render Appliances Section (Excluded Items)
                             const applianceSection = applianceItems.length > 0 ? (
                                 <div key="appliance-section" className="mb-8 border border-slate-200 border-dashed rounded-lg overflow-hidden opacity-75">
                                     <div className="bg-slate-50 px-4 py-2 border-b border-slate-200 flex justify-between items-center">
@@ -1736,6 +1879,7 @@ export const QuotationFlow: React.FC = () => {
                             return [
                                 ...cabinetSections, 
                                 hardwareSection, 
+                                finishingSection,
                                 applianceSection
                             ];
                         })()}

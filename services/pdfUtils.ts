@@ -26,60 +26,45 @@ export interface PDFPageImage {
 
 export async function extractTextFromPdf(file: File): Promise<string> {
     const pdfjsLib = await getPdfJs();
-    const arrayBuffer = await file.arrayBuffer();
     try {
+        const arrayBuffer = await file.arrayBuffer();
         const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
         const pdf = await loadingTask.promise;
         const numPages = pdf.numPages;
-        console.log(`Extracting text from PDF (${numPages} pages)...`);
+        const textPages: string[] = [];
 
-        let fullText = "";
-        
-        // Process pages in chunks to balance speed and memory
-        // Parallelizing ALL pages at once might crash browser for large docs
-        // So we batch them in groups of 5
-        const CHUNK_SIZE = 5;
-        const pageChunks = [];
+        // Process in chunks to avoid UI freezing
+        // Text extraction is fast, so larger chunks (25) are safe and reduce overhead
+        const CHUNK_SIZE = 25; 
         for (let i = 1; i <= numPages; i += CHUNK_SIZE) {
-            const chunk = [];
-            for (let j = 0; j < CHUNK_SIZE && i + j <= numPages; j++) {
-                chunk.push(i + j);
-            }
-            pageChunks.push(chunk);
-        }
-
-        
-        for (const chunk of pageChunks) {
-            const chunkPromises = chunk.map(async (pageNum) => {
-                try {
-                    const page = await pdf.getPage(pageNum);
-                    const textContent = await page.getTextContent();
-                    // Preserve layout by joining with newline instead of space
-                    const pageText = textContent.items
-                        .map((item: any) => item.str)
-                        .join('\n');
-                    console.log(`Page ${pageNum} text length: ${pageText.length}`);
-                    return { pageNum, text: pageText };
-                } catch (pageErr) {
-                    console.warn(`Failed to extract text from page ${pageNum}`, pageErr);
-                    return { pageNum, text: "" };
-                }
-            });
-
-            const results = await Promise.all(chunkPromises);
-            // Sort by page number to maintain document order
-            results.sort((a, b) => a.pageNum - b.pageNum);
+            const chunkPromises = [];
+            const end = Math.min(i + CHUNK_SIZE - 1, numPages);
             
-            results.forEach(r => {
-                 // Add extra newlines to ensure clean separation for regex splitting
-                 fullText += `\n\n--- PAGE ${r.pageNum} ---\n\n${r.text}`;
-            });
+            for (let j = i; j <= end; j++) {
+                chunkPromises.push(pdf.getPage(j).then(async (page) => {
+                    const textContent = await page.getTextContent();
+                    const text = textContent.items.map((item: any) => item.str).join(' ');
+                    // Add delimiter for page splitting in AI service
+                    return `--- PAGE ${j} ---\n${text}\n`;
+                }));
+            }
+            
+            const results = await Promise.all(chunkPromises);
+            // Maintain order within chunk
+            results.sort((a, b) => {
+                const pageA = parseInt(a.match(/--- PAGE (\d+) ---/)?.[1] || "0");
+                const pageB = parseInt(b.match(/--- PAGE (\d+) ---/)?.[1] || "0");
+                return pageA - pageB;
+            }).forEach(r => textPages.push(r));
+            
+            // Minimal delay for text extraction
+            if (i + CHUNK_SIZE <= numPages) await new Promise(resolve => setTimeout(resolve, 5));
         }
-        
-        return fullText;
-    } catch (err) {
-        console.error("Text extraction failed:", err);
-        return "";
+
+        return textPages.join('\n');
+    } catch (error) {
+        console.error("Error extracting text from PDF:", error);
+        throw new Error("Failed to extract text from PDF");
     }
 }
 
@@ -106,7 +91,8 @@ export async function convertPdfToImages(file: File, pagesToRender?: number[]): 
 
         // Process pages in chunks to prevent UI freezing and browser crashes
         // Rendering high-res canvases is expensive.
-        const CHUNK_SIZE = 3; 
+        // INCREASED CHUNK SIZE for 100-page speed optimization
+        const CHUNK_SIZE = 5; 
         const results: (PDFPageImage | null)[] = [];
 
         for (let i = 0; i < pageNumbers.length; i += CHUNK_SIZE) {
@@ -117,9 +103,9 @@ export async function convertPdfToImages(file: File, pagesToRender?: number[]): 
                 try {
                     const page = await pdf.getPage(pageNum);
                     
-                    // Scale logic: Balanced quality for AI (2048px is standard for high-res LLM vision)
-                    // Target max dimension ~2048px (2K resolution) to ensure speed while keeping labels readable
-                    // Previous 3072px was too slow for client-side rendering
+                    // Scale logic: Balanced quality for AI (2048px is standard for high-res LLM vision speed)
+                    // Target max dimension ~2048px to ensure legibility of small cabinet codes
+                    // 1600px was too blurry for some "W3042 BUTT" labels.
                     let scale = 3.0; 
                     const unscaledViewport = page.getViewport({ scale: 1.0 });
                     const maxDim = Math.max(unscaledViewport.width, unscaledViewport.height);
@@ -144,8 +130,9 @@ export async function convertPdfToImages(file: File, pagesToRender?: number[]): 
                         viewport: viewport
                     } as any).promise;
 
-                    // Convert to JPEG with quality 0.8 (slightly higher to compensate for lower res)
-                    const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+                    // Convert to JPEG with quality 0.7 (Good Web Quality)
+                    // Increased from 0.5 to 0.7 to improve text sharpness for OCR
+                    const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
                     
                     // Strip prefix
                     const cleanData = dataUrl.split(',')[1];
@@ -167,8 +154,8 @@ export async function convertPdfToImages(file: File, pagesToRender?: number[]): 
             const chunkResults = await Promise.all(chunkPromises);
             results.push(...chunkResults);
             
-            // Small delay to let the UI breathe
-            await new Promise(resolve => setTimeout(resolve, 50));
+            // Reduced delay to 10ms (was 50ms) to speed up batch processing
+            await new Promise(resolve => setTimeout(resolve, 10));
         }
         
         // Filter out any failed pages (nulls) and sort by page number to be safe

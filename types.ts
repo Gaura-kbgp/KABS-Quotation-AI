@@ -1,6 +1,6 @@
 
 
-export type CabinetType = 'Base' | 'Wall' | 'Tall' | 'Panel' | 'Filler' | 'Accessory' | 'Modification' | 'Appliance' | 'Hardware';
+export type CabinetType = 'Base' | 'Wall' | 'Tall' | 'Panel' | 'Filler' | 'Accessory' | 'Modification' | 'Appliance' | 'Hardware' | 'Finishing';
 
 export interface CabinetModification {
   description: string;
@@ -20,6 +20,8 @@ export interface CabinetItem {
   notes?: string;
   room?: string; // NEW: Room Name (e.g. "Kitchen", "Master Bath")
   extractedPrice?: number; // Price found in the PDF/Image
+  sourcePage?: number; // Page number where the item was found
+  isManual?: boolean; // Flag for manually added items
   modifications?: CabinetModification[]; // Add-ons like Skins, Depth changes
 }
 
