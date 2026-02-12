@@ -272,6 +272,7 @@ export const QuotationFlow: React.FC = () => {
       const newPricing = project.pricing ? [...project.pricing, newItem] : [newItem];
       
       updateProject({ items: newItems, pricing: newPricing });
+      setToastMessage("New manual entry added");
   };
 
   const handleBOMUpdate = async (itemId: string, field: 'code' | 'quantity' | 'price', value: string | number) => {
@@ -715,14 +716,9 @@ export const QuotationFlow: React.FC = () => {
     yPos += 6 + specsBoxH + 4;
 
     // --- GROUPED ITEMS LOGIC ---
-    // 1. Separate Items by Category for PDF
-    const cabinetItems = validItems.filter(i => !['Appliance', 'Hardware', 'Finishing'].includes(i.type));
-    const hardwareItems = validItems.filter(i => i.type === 'Hardware');
-    const finishingItems = validItems.filter(i => i.type === 'Finishing');
-    const applianceItems = validItems.filter(i => i.type === 'Appliance');
-
+    // 1. Group All Items by Room for PDF
     const roomGroups: Record<string, PricingLineItem[]> = {};
-    cabinetItems.forEach(item => {
+    validItems.forEach(item => {
         const room = item.room || "General / Additional Items";
         if (!roomGroups[room]) roomGroups[room] = [];
         roomGroups[room].push(item);
@@ -732,38 +728,24 @@ export const QuotationFlow: React.FC = () => {
          // --- SUMMARY TABLE ---
          const summaryBody: any[] = [];
          
-         // Cabinets by Room
+         // Items by Room
          Object.entries(roomGroups).forEach(([roomName, items]) => {
              const roomTotal = items.reduce((sum, i) => sum + i.totalPrice, 0);
              const itemCount = items.reduce((sum, i) => sum + i.quantity, 0);
-             const desc = `Cabinetry - ${s.wallDoorStyle || 'Standard'}`;
-             summaryBody.push([roomName, desc, `${itemCount} items`, `$${roomTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}`]);
+             summaryBody.push([roomName, `${itemCount} items`, `$${roomTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}`]);
          });
-
-         // Hardware Summary
-         if (hardwareItems.length > 0) {
-             const hwTotal = hardwareItems.reduce((sum, i) => sum + i.totalPrice, 0);
-             summaryBody.push(['Hardware', 'Hinges, Glides & Mechanisms', `${hardwareItems.length} items`, `$${hwTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}`]);
-         }
-
-         // Finishing Summary
-         if (finishingItems.length > 0) {
-             const finTotal = finishingItems.reduce((sum, i) => sum + i.totalPrice, 0);
-             summaryBody.push(['Finishing', 'Touch Up, Paint & Fillers', `${finishingItems.length} items`, `$${finTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}`]);
-         }
          
          autoTable(doc, {
             startY: yPos,
-            head: [['Area / Category', 'Description', 'Quantity', 'Total Price']],
+            head: [['Area / Category', 'Quantity', 'Total Price']],
             body: summaryBody,
             theme: 'plain',
             styles: { fontSize: 9, cellPadding: 3, lineColor: [200, 200, 200], lineWidth: 0.1, valign: 'middle' },
             headStyles: { fillColor: [240, 240, 240], textColor: [0, 0, 0], fontStyle: 'bold', lineWidth: 0.1, lineColor: [200, 200, 200] },
             columnStyles: {
-                0: { cellWidth: 50, fontStyle: 'bold' },
-                1: { cellWidth: 80 },
-                2: { cellWidth: 30, halign: 'center' },
-                3: { cellWidth: 30, halign: 'right' }
+                0: { cellWidth: 130, fontStyle: 'bold' },
+                1: { cellWidth: 30, halign: 'center' },
+                2: { cellWidth: 30, halign: 'right' }
             },
             margin: { left: 14, right: 14 },
          });
@@ -794,36 +776,87 @@ export const QuotationFlow: React.FC = () => {
 
             // Body
             const tableBody: any[] = [];
-            items.forEach((item, index) => {
-                const itemNum = index + 1;
-                const desc = item.width > 0 
-                    ? `${item.description} (${item.width}"W x ${item.height}"H x ${item.depth}"D)`
-                    : item.description;
+            
+            // Sub-Grouping Logic
+            const categorized: Record<string, PricingLineItem[]> = {};
+            items.forEach(item => {
+                 let cat = item.type as string;
+                 const roomLower = title.toLowerCase();
+                 
+                 // Map Types to Display Categories (Consistent with UI)
+                 if (item.isManual || item.originalCode === 'NEW ITEM' || item.description === 'Manual Entry') {
+                     cat = 'Manual / Added Items';
+                 }
+                 else if (cat === 'Base') {
+                     cat = (roomLower.includes('bath') || roomLower.includes('vanity') || roomLower.includes('ensuite') || roomLower.includes('powder')) 
+                         ? 'Vanity Cabinets' 
+                         : 'Base Cabinets';
+                 }
+                 else if (cat === 'Wall') cat = 'Wall Cabinets';
+                 else if (cat === 'Tall') cat = 'Tall Cabinets';
+                 else if (cat === 'Hardware') cat = 'Hinges & Hardware';
+                 else if (cat === 'Finishing' || cat === 'Panel' || cat === 'Filler') cat = 'Finishing, Panels & Fillers';
+                 else if (cat === 'Appliance') cat = 'Appliances';
+                 else if (cat === 'Accessory') cat = 'Accessories';
+                 else if (cat === 'Modification') cat = 'Modifications';
+                 else cat = 'Other Items';
 
-                tableBody.push([
-                    itemNum.toString(),
-                    item.quantity.toString(),
-                    item.originalCode,
-                    desc,
-                    `$${item.totalPrice.toLocaleString(undefined, {minimumFractionDigits: 2})}`
-                ]);
-                
-                // Modifications & Options logic...
-                if (item.modifications) {
-                    item.modifications.forEach((mod) => {
-                        tableBody.push(['', '', mod.description.includes('FINISH END') ? (mod.description.includes('Left') ? 'FEL' : 'FER') : 'MOD', `${mod.description}`, `$${(mod.price || 0).toFixed(2)}`]);
-                    });
-                }
-                if (item.appliedOptions) {
-                    item.appliedOptions.forEach((opt) => {
-                        tableBody.push(['', '', 'OPT', `${opt.name}`, `$${opt.price.toFixed(2)}`]);
-                    });
-                }
+                 if (!categorized[cat]) categorized[cat] = [];
+                 categorized[cat].push(item);
+            });
+
+            const displayOrder = [
+                'Wall Cabinets', 'Base Cabinets', 'Vanity Cabinets', 'Tall Cabinets', 
+                'Appliances', 'Hinges & Hardware', 'Finishing, Panels & Fillers', 
+                'Accessories', 'Modifications', 'Other Items', 'Manual / Added Items'
+            ];
+
+            const sortedCats = Object.keys(categorized).sort((a, b) => {
+                const ia = displayOrder.indexOf(a);
+                const ib = displayOrder.indexOf(b);
+                return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+            });
+
+            let globalIndex = 1;
+
+            sortedCats.forEach(cat => {
+                // Add Category Header Row
+                tableBody.push([{ 
+                    content: cat, 
+                    colSpan: 5, 
+                    styles: { fillColor: [250, 250, 250], fontStyle: 'bold', textColor: [80, 80, 80], halign: 'left', cellPadding: 1 } 
+                }]);
+
+                categorized[cat].forEach((item) => {
+                    const codeWithDims = item.width > 0 
+                        ? `${item.originalCode}\n${item.width}"W x ${item.height}"H x ${item.depth}"D`
+                        : item.originalCode;
+
+                    tableBody.push([
+                        globalIndex.toString(),
+                        item.quantity.toString(),
+                        codeWithDims,
+                        `$${item.totalPrice.toLocaleString(undefined, {minimumFractionDigits: 2})}`
+                    ]);
+                    globalIndex++;
+                    
+                    // Modifications & Options logic...
+                    if (item.modifications) {
+                        item.modifications.forEach((mod) => {
+                            tableBody.push(['', '', `${mod.description.includes('FINISH END') ? (mod.description.includes('Left') ? 'FEL' : 'FER') : 'MOD'} - ${mod.description}`, `$${(mod.price || 0).toFixed(2)}`]);
+                        });
+                    }
+                    if (item.appliedOptions) {
+                        item.appliedOptions.forEach((opt) => {
+                            tableBody.push(['', '', `OPT - ${opt.name}`, `$${opt.price.toFixed(2)}`]);
+                        });
+                    }
+                });
             });
 
             autoTable(doc, {
                 startY: yPos,
-                head: [['Item', 'Qty.', 'Product Code', 'Description', 'Price']],
+                head: [['Item', 'Qty.', 'Product Code', 'Price']],
                 body: tableBody,
                 theme: 'plain',
                 styles: { fontSize: 8, cellPadding: 2, lineColor: [200, 200, 200], lineWidth: 0.1, valign: 'middle' },
@@ -831,13 +864,12 @@ export const QuotationFlow: React.FC = () => {
                 columnStyles: {
                     0: { cellWidth: 10, halign: 'center' },
                     1: { cellWidth: 10, halign: 'center' },
-                    2: { cellWidth: 35, fontStyle: 'bold' },
-                    3: { cellWidth: 97 },
-                    4: { cellWidth: 30, halign: 'right' }
+                    2: { cellWidth: 130, fontStyle: 'bold' },
+                    3: { cellWidth: 30, halign: 'right' }
                 },
                 margin: { left: 14, right: 14, top: 20, bottom: 20 },
                 didParseCell: (data) => {
-                     if (data.section === 'body' && data.column.index === 4) {
+                     if (data.section === 'body' && data.column.index === 3) {
                          const text = data.cell.raw as string;
                          if (text.includes('CHECK PRICE')) {
                              data.cell.styles.textColor = [220, 38, 38];
@@ -861,20 +893,10 @@ export const QuotationFlow: React.FC = () => {
             yPos += 12;
         };
 
-        // 1. Cabinet Rooms
+        // 1. Room Tables (Includes all categories)
         Object.entries(roomGroups).forEach(([roomName, items]) => {
             printTable(roomName, items);
         });
-
-        // 2. Hardware Section
-        if (hardwareItems.length > 0) {
-            printTable("Hardware & Mechanisms", hardwareItems, [255, 237, 213]); // Orange-ish header
-        }
-
-        // 3. Finishing Section
-        if (finishingItems.length > 0) {
-            printTable("Finishing & Touch Up", finishingItems, [243, 232, 255]); // Purple-ish header
-        }
         
         // 4. Appliances (Optional - usually not priced, but if we wanted to show them...)
         // We typically exclude them from the formal quote unless they have prices.
@@ -1042,7 +1064,7 @@ export const QuotationFlow: React.FC = () => {
         // Wait a tick to ensure UI updates
         await new Promise(r => setTimeout(r, 100));
 
-        setLoadingMessage("AI Vision Analyzing Plan (This may take 30-60s)...");
+        setLoadingMessage("AI Vision Analyzing Plan (Fast Deep Scan: 15-30s)...");
         const result = await analyzePlan(file, nkbaRules?.data);
         
         if (result.items.length === 0) {
@@ -1380,61 +1402,122 @@ export const QuotationFlow: React.FC = () => {
                </div>
            </td>
        </tr>
-               {roomGroup.items.map(item => (
-                    <tr key={item.id} className={`hover:bg-blue-50 group border-b border-slate-100 ${selectedItems.has(item.id) ? 'bg-blue-50' : ''}`}>
-                        <td className="px-3 py-3 text-center">
-                            <input 
-                                type="checkbox" 
-                                className="rounded border-slate-300 text-brand-600 focus:ring-brand-500 h-4 w-4"
-                                checked={selectedItems.has(item.id)}
-                                onChange={() => toggleSelection(item.id)}
-                            />
-                        </td>
-                        <td className="px-6 py-3 text-sm text-slate-900 pl-4">
-                            <DebouncedInput 
-                                className="w-full bg-transparent border-none focus:bg-white focus:ring-1 focus:ring-brand-500 px-1 py-0.5" 
-                                value={item.description} 
-                                onChange={(val: string) => updateProjectItem(item.id, { description: val })}
-                            />
-                            <div className="text-xs text-slate-400 mt-0.5">
-                                {item.width > 0 && `${item.width}" W x `}{item.height}" H x {item.depth}" D
-                            </div>
-                            {item.modifications && item.modifications.length > 0 && (
-                                <div className="mt-1 pl-2 border-l-2 border-slate-200 text-xs text-slate-500">
-                                    {item.modifications.map((m, i) => (<div key={i}>+ {m.description}</div>))}
-                                </div>
-                            )}
-                        </td>
-                       <td className="px-6 py-3 text-sm text-slate-500 font-mono">
-                           <DebouncedInput 
-                               className="w-full bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5 font-bold text-slate-800" 
-                               value={item.originalCode} 
-                               onChange={(val: string) => updateProjectItem(item.id, { originalCode: val.toUpperCase() })}
-                           />
-                       </td>
-                       <td className="px-6 py-3 text-sm text-brand-700 font-bold font-mono">
-                           {item.normalizedCode || item.originalCode}
-                       </td>
-                       <td className="px-6 py-3 text-center font-medium">
-                           <DebouncedInput 
-                               type="number" 
-                               className="w-16 text-center bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5" 
-                               value={item.quantity} 
-                               onChange={(val: number) => updateProjectItem(item.id, { quantity: val || 0 })}
-                           />
-                       </td>
-                       <td className="px-4 py-3 text-right">
-                           <button 
-                               type="button" 
-                               onClick={() => deleteProjectItem(item.id)} 
-                               className="p-1.5 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded transition-colors" 
-                               title="Remove Item"
-                           >
-                               <Trash2 className="w-4 h-4"/>
-                           </button>
-                       </td>
-                   </tr>
-               ))}
+               {(() => {
+                   // Sub-Distribution Logic
+                   const categorized = roomGroup.items.reduce((acc, item) => {
+                        let cat = item.type as string;
+                        const roomLower = roomGroup.room.toLowerCase();
+                        
+                        // Check for Manual Items - Group them separately at the end
+                        if (item.isManual || item.originalCode === 'NEW ITEM' || item.description === 'Manual Entry') {
+                            cat = 'Manual / Added Items';
+                        }
+                        // Map Types to Display Categories
+                        else if (cat === 'Base') {
+                            cat = (roomLower.includes('bath') || roomLower.includes('vanity') || roomLower.includes('ensuite') || roomLower.includes('powder')) 
+                                ? 'Vanity Cabinets' 
+                                : 'Base Cabinets';
+                        }
+                        else if (cat === 'Wall') cat = 'Wall Cabinets';
+                        else if (cat === 'Tall') cat = 'Tall Cabinets';
+                        else if (cat === 'Hardware') cat = 'Hinges & Hardware';
+                        else if (cat === 'Finishing' || cat === 'Panel' || cat === 'Filler') cat = 'Finishing, Panels & Fillers';
+                        else if (cat === 'Appliance') cat = 'Appliances';
+                        else if (cat === 'Accessory') cat = 'Accessories';
+                        else if (cat === 'Modification') cat = 'Modifications';
+                        else cat = 'Other Items';
+
+                        if (!acc[cat]) acc[cat] = [];
+                        acc[cat].push(item);
+                        return acc;
+                   }, {} as Record<string, typeof roomGroup.items>);
+
+                   const displayOrder = [
+                       'Wall Cabinets', 
+                       'Base Cabinets', 
+                       'Vanity Cabinets', 
+                       'Tall Cabinets', 
+                       'Appliances', 
+                       'Hinges & Hardware', 
+                       'Finishing, Panels & Fillers', 
+                       'Accessories', 
+                       'Modifications',
+                       'Other Items',
+                       'Manual / Added Items'
+                   ];
+
+                   const sortedCats = Object.keys(categorized).sort((a, b) => {
+                       const ia = displayOrder.indexOf(a);
+                       const ib = displayOrder.indexOf(b);
+                       return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+                   });
+
+                   return sortedCats.map(category => (
+                       <React.Fragment key={category}>
+                           <tr className="bg-slate-50/50 border-b border-slate-100">
+                               <td colSpan={6} className="px-4 py-1.5 text-xs font-bold text-slate-500 uppercase tracking-wider pl-12 flex items-center gap-2">
+                                   <div className="w-1.5 h-1.5 rounded-full bg-slate-300"></div>
+                                   {category}
+                               </td>
+                           </tr>
+                           {categorized[category].map(item => (
+                                <tr key={item.id} className={`hover:bg-blue-50 group border-b border-slate-100 ${selectedItems.has(item.id) ? 'bg-blue-50' : ''}`}>
+                                    <td className="px-3 py-3 text-center">
+                                        <input 
+                                            type="checkbox" 
+                                            className="rounded border-slate-300 text-brand-600 focus:ring-brand-500 h-4 w-4"
+                                            checked={selectedItems.has(item.id)}
+                                            onChange={() => toggleSelection(item.id)}
+                                        />
+                                    </td>
+                                    <td className="px-6 py-3 text-sm text-slate-900 pl-4">
+                                        <DebouncedInput 
+                                            className="w-full bg-transparent border-none focus:bg-white focus:ring-1 focus:ring-brand-500 px-1 py-0.5" 
+                                            value={item.description} 
+                                            onChange={(val: string) => updateProjectItem(item.id, { description: val })}
+                                        />
+                                        <div className="text-xs text-slate-400 mt-0.5">
+                                            {item.width > 0 && `${item.width}" W x `}{item.height}" H x {item.depth}" D
+                                        </div>
+                                        {item.modifications && item.modifications.length > 0 && (
+                                            <div className="mt-1 pl-2 border-l-2 border-slate-200 text-xs text-slate-500">
+                                                {item.modifications.map((m, i) => (<div key={i}>+ {m.description}</div>))}
+                                            </div>
+                                        )}
+                                    </td>
+                                   <td className="px-6 py-3 text-sm text-slate-500 font-mono">
+                                       <DebouncedInput 
+                                           className="w-full bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5 font-bold text-slate-800" 
+                                           value={item.originalCode} 
+                                           onChange={(val: string) => updateProjectItem(item.id, { originalCode: val.toUpperCase() })}
+                                       />
+                                   </td>
+                                   <td className="px-6 py-3 text-sm text-brand-700 font-bold font-mono">
+                                       {item.normalizedCode || item.originalCode}
+                                   </td>
+                                   <td className="px-6 py-3 text-center font-medium">
+                                       <DebouncedInput 
+                                           type="number" 
+                                           className="w-16 text-center bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5" 
+                                           value={item.quantity} 
+                                           onChange={(val: number) => updateProjectItem(item.id, { quantity: val || 0 })}
+                                       />
+                                   </td>
+                                   <td className="px-4 py-3 text-right">
+                                       <button 
+                                           type="button" 
+                                           onClick={() => deleteProjectItem(item.id)} 
+                                           className="p-1.5 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded transition-colors" 
+                                           title="Remove Item"
+                                       >
+                                           <Trash2 className="w-4 h-4"/>
+                                       </button>
+                                   </td>
+                               </tr>
+                           ))}
+                       </React.Fragment>
+                   ));
+               })()}
                <tr className="bg-white">
                     <td colSpan={6} className="px-6 py-2 pl-12">
                          <Button variant="ghost" size="sm" onClick={() => handleAddItem(roomGroup.room, 'Base')} className="text-brand-600 hover:text-brand-700 hover:bg-brand-50 text-xs flex items-center gap-1">
@@ -1675,14 +1758,62 @@ export const QuotationFlow: React.FC = () => {
                             });
 
                             // 3. Render Cabinet Groups
-                            const cabinetSections = Object.entries(groups).map(([roomName, items]) => (
+                            const cabinetSections = Object.entries(groups).map(([roomName, roomItems]) => {
+                                // Sub-Grouping Logic (Same as PDF)
+                                const categorized: Record<string, PricingLineItem[]> = {};
+                                const roomLower = roomName.toLowerCase();
+                                
+                                roomItems.forEach(item => {
+                                    let cat = item.type as string;
+                                    
+                                    // Map Types to Display Categories
+                                    if (cat === 'Base') {
+                                        cat = (roomLower.includes('bath') || roomLower.includes('vanity') || roomLower.includes('ensuite') || roomLower.includes('powder')) 
+                                            ? 'Vanity Cabinets' 
+                                            : 'Base Cabinets';
+                                    }
+                                    else if (cat === 'Wall') cat = 'Wall Cabinets';
+                                    else if (cat === 'Tall') cat = 'Tall Cabinets';
+                                    else if (cat === 'Hardware') cat = 'Hinges & Hardware';
+                                    else if (cat === 'Finishing' || cat === 'Panel' || cat === 'Filler') cat = 'Finishing, Panels & Fillers';
+                                    else if (cat === 'Appliance') cat = 'Appliances';
+                                    else if (cat === 'Accessory') cat = 'Accessories';
+                                    else if (cat === 'Modification') cat = 'Modifications';
+                                    
+                                    if (!categorized[cat]) categorized[cat] = [];
+                                    categorized[cat].push(item);
+                                });
+
+                                // Define Sort Order
+                                const categoryOrder = [
+                                    'Wall Cabinets', 
+                                    'Base Cabinets', 
+                                    'Vanity Cabinets', 
+                                    'Tall Cabinets', 
+                                    'Appliances', 
+                                    'Accessories', 
+                                    'Hinges & Hardware', 
+                                    'Finishing, Panels & Fillers', 
+                                    'Modifications'
+                                ];
+
+                                const sortedCategories = Object.keys(categorized).sort((a, b) => {
+                                    const idxA = categoryOrder.indexOf(a);
+                                    const idxB = categoryOrder.indexOf(b);
+                                    if (idxA !== -1 && idxB !== -1) return idxA - idxB;
+                                    if (idxA !== -1) return -1;
+                                    if (idxB !== -1) return 1;
+                                    return a.localeCompare(b);
+                                });
+
+                                return (
                                 <div key={roomName} className="mb-8 border border-slate-200 rounded-lg overflow-hidden shadow-sm">
                                     <div className="bg-slate-100 px-4 py-3 border-b border-slate-200 flex justify-between items-center">
                                         <div className="flex items-center gap-4">
                                             <div className="flex items-center gap-2">
                                                 <Layers className="w-5 h-5 text-brand-600" />
                                                 <h3 className="font-bold text-lg text-slate-800">{roomName}</h3>
-                                                <span className="bg-white border border-slate-200 text-slate-600 px-2 py-0.5 rounded-full text-xs font-medium">{items.length} items</span>
+                                                <span className="bg-white border border-slate-200 text-slate-600 px-2 py-0.5 rounded-full text-xs font-medium">{roomItems.length} items</span>
                                             </div>
                                             <div className="flex items-center gap-2 text-xs">
                                                 <span className="text-slate-400 font-medium uppercase tracking-wide">Markup Factor:</span>
@@ -1701,7 +1832,7 @@ export const QuotationFlow: React.FC = () => {
                                         </div>
                                         <div className="text-right">
                                             <div className="text-[10px] text-slate-400 uppercase font-bold tracking-wider">Subtotal</div>
-                                            <div className="text-lg font-bold text-slate-900">${items.reduce((acc, i) => acc + i.totalPrice, 0).toLocaleString()}</div>
+                                            <div className="text-lg font-bold text-slate-900">${roomItems.reduce((acc, i) => acc + i.totalPrice, 0).toLocaleString()}</div>
                                         </div>
                                     </div>
                                     
@@ -1710,7 +1841,6 @@ export const QuotationFlow: React.FC = () => {
                                             <tr>
                                                 <th className="px-4 py-2 text-left text-xs font-bold uppercase tracking-wider">#</th>
                                                 <th className="px-4 py-2 text-left text-xs font-bold uppercase tracking-wider">Code</th>
-                                                <th className="px-4 py-2 text-left text-xs font-bold uppercase tracking-wider">Description</th>
                                                 <th className="px-4 py-2 text-center text-xs font-bold uppercase tracking-wider">Qty</th>
                                                 <th className="px-4 py-2 text-right text-xs font-bold uppercase tracking-wider">Unit Price</th>
                                                 <th className="px-4 py-2 text-right text-xs font-bold uppercase tracking-wider">Total</th>
@@ -1718,52 +1848,71 @@ export const QuotationFlow: React.FC = () => {
                                             </tr>
                                         </thead>
                                         <tbody className="bg-white divide-y divide-slate-100">
-                                            {items.map((item, index) => (
-                                                <tr key={item.id} className={`hover:bg-slate-50 ${item.totalPrice === 0 ? 'bg-red-50/30' : ''}`}>
-                                                    <td className="px-4 py-3 text-slate-400 text-sm">{index + 1}</td>
-                                                    <td className="px-4 py-3 font-mono font-bold text-slate-800 text-sm">
-                                                        <DebouncedInput 
-                                                            className="w-full bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5 font-bold text-slate-800" 
-                                                            value={item.originalCode} 
-                                                            onChange={(val: string) => handleBOMUpdate(item.id, 'code', val)}
-                                                        />
-                                                        {item.originalCode !== item.normalizedCode && (<div className="text-xs text-slate-400 font-normal mt-0.5">Norm: {item.normalizedCode}</div>)}
-                                                        <div className="text-[10px] text-slate-400 mt-1 truncate max-w-[150px]" title={item.source}>{item.source}</div>
-                                                    </td>
-                                                    <td className="px-4 py-3 text-sm text-slate-700"><div className="font-medium">{item.description}</div><div className="text-xs text-slate-500 mt-0.5">{item.width}"W x {item.height}"H x {item.depth}"D</div>{item.appliedOptions && item.appliedOptions.length > 0 && (<div className="mt-1 flex flex-wrap gap-1">{item.appliedOptions.map((opt, i) => (<span key={i} className="text-[10px] bg-green-50 text-green-700 px-1.5 py-0.5 rounded border border-green-100">+{opt.name} (${opt.price})</span>))}</div>)}</td>
-                                                    <td className="px-4 py-3 text-center text-sm font-medium">
-                                                        <DebouncedInput 
-                                                            type="number" 
-                                                            className="w-16 text-center bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5" 
-                                                            value={item.quantity} 
-                                                            onChange={(val: number) => handleBOMUpdate(item.id, 'quantity', val)}
-                                                        />
-                                                    </td>
-                                                    <td className="px-4 py-3 text-right text-sm">
-                                                        <div className="flex items-center justify-end gap-1">
-                                                            <span className="text-slate-400 text-xs">$</span>
-                                                            <DebouncedInput 
-                                                                type="number" 
-                                                                className={`w-20 text-right bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5 ${item.finalUnitPrice === 0 ? 'text-red-600 font-bold' : 'text-slate-600'}`}
-                                                                value={item.finalUnitPrice} 
-                                                                onChange={(val: number) => handleBOMUpdate(item.id, 'price', val)}
-                                                            />
-                                                        </div>
-                                                        {item.finalUnitPrice === 0 && (
-                                                            <div className="text-[10px] text-red-500 mt-1 text-right font-bold flex items-center justify-end gap-1"><AlertCircle className="w-3 h-3"/> CHECK PRICE</div>
-                                                        )}
-                                                    </td>
-                                                    <td className="px-4 py-3 text-right text-sm font-bold">{item.totalPrice === 0 ? (<span className="text-red-600">$0.00</span>) : (<span className="text-slate-900">${item.totalPrice.toLocaleString()}</span>)}</td>
-                                                    <td className="px-4 py-3 text-center">
-                                                        <button 
-                                                            onClick={() => deleteProjectItem(item.id)}
-                                                            className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors"
-                                                            title="Remove Item"
-                                                        >
-                                                            <Trash2 className="w-4 h-4" />
-                                                        </button>
-                                                    </td>
-                                                </tr>
+                                            {sortedCategories.map(cat => (
+                                                <React.Fragment key={cat}>
+                                                    {/* Category Header */}
+                                                    <tr className="bg-slate-50/80">
+                                                        <td colSpan={7} className="px-4 py-1.5 text-xs font-bold text-slate-500 uppercase tracking-wider border-b border-slate-100">
+                                                            {cat}
+                                                        </td>
+                                                    </tr>
+                                                    {categorized[cat].map((item, index) => (
+                                                        <tr key={item.id} className={`hover:bg-slate-50 ${item.totalPrice === 0 ? 'bg-red-50/30' : ''}`}>
+                                                            <td className="px-4 py-3 text-slate-400 text-sm">{index + 1}</td>
+                                                            <td className="px-4 py-3 font-mono font-bold text-slate-800 text-sm">
+                                                                <DebouncedInput 
+                                                                    className="w-full bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5 font-bold text-slate-800" 
+                                                                    value={item.originalCode} 
+                                                                    onChange={(val: string) => handleBOMUpdate(item.id, 'code', val)}
+                                                                />
+                                                                {item.originalCode !== item.normalizedCode && (<div className="text-xs text-slate-400 font-normal mt-0.5">Norm: {item.normalizedCode}</div>)}
+                                                                
+                                                                {/* Dimensions & Options moved here */}
+                                                                <div className="text-xs text-slate-500 mt-0.5 font-normal">{item.width}"W x {item.height}"H x {item.depth}"D</div>
+                                                                {item.appliedOptions && item.appliedOptions.length > 0 && (
+                                                                    <div className="mt-1 flex flex-wrap gap-1">
+                                                                        {item.appliedOptions.map((opt, i) => (
+                                                                            <span key={i} className="text-[10px] bg-green-50 text-green-700 px-1.5 py-0.5 rounded border border-green-100 font-sans font-normal">+{opt.name} (${opt.price})</span>
+                                                                        ))}
+                                                                    </div>
+                                                                )}
+                                                                <div className="text-[10px] text-slate-400 mt-1 truncate max-w-[150px] font-sans font-normal" title={item.source}>{item.source}</div>
+                                                            </td>
+                                                            <td className="px-4 py-3 text-center text-sm font-medium">
+                                                                <DebouncedInput 
+                                                                    type="number" 
+                                                                    className="w-16 text-center bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5" 
+                                                                    value={item.quantity} 
+                                                                    onChange={(val: number) => handleBOMUpdate(item.id, 'quantity', val)}
+                                                                />
+                                                            </td>
+                                                            <td className="px-4 py-3 text-right text-sm">
+                                                                <div className="flex items-center justify-end gap-1">
+                                                                    <span className="text-slate-400 text-xs">$</span>
+                                                                    <DebouncedInput 
+                                                                        type="number" 
+                                                                        className={`w-20 text-right bg-transparent border-b border-dashed border-slate-300 focus:border-brand-500 focus:outline-none focus:bg-white px-1 py-0.5 ${item.finalUnitPrice === 0 ? 'text-red-600 font-bold' : 'text-slate-600'}`}
+                                                                        value={item.finalUnitPrice} 
+                                                                        onChange={(val: number) => handleBOMUpdate(item.id, 'price', val)}
+                                                                    />
+                                                                </div>
+                                                                {item.finalUnitPrice === 0 && (
+                                                                    <div className="text-[10px] text-red-500 mt-1 text-right font-bold flex items-center justify-end gap-1"><AlertCircle className="w-3 h-3"/> CHECK PRICE</div>
+                                                                )}
+                                                            </td>
+                                                            <td className="px-4 py-3 text-right text-sm font-bold">{item.totalPrice === 0 ? (<span className="text-red-600">$0.00</span>) : (<span className="text-slate-900">${item.totalPrice.toLocaleString()}</span>)}</td>
+                                                            <td className="px-4 py-3 text-center">
+                                                                <button 
+                                                                    onClick={() => deleteProjectItem(item.id)}
+                                                                    className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors"
+                                                                    title="Remove Item"
+                                                                >
+                                                                    <Trash2 className="w-4 h-4" />
+                                                                </button>
+                                                            </td>
+                                                        </tr>
+                                                    ))}
+                                                </React.Fragment>
                                             ))}
                                         </tbody>
                                     </table>
@@ -1773,7 +1922,8 @@ export const QuotationFlow: React.FC = () => {
                                          </Button>
                                     </div>
                                 </div>
-                            ));
+                            );
+                        });
 
                             // 4. Render Hardware Section
                             const hardwareSection = hardwareItems.length > 0 ? (
@@ -1791,7 +1941,7 @@ export const QuotationFlow: React.FC = () => {
                                     <table className="min-w-full divide-y divide-orange-100">
                                         <thead className="bg-orange-50/50 text-orange-500">
                                             <tr>
-                                                <th className="px-4 py-2 text-left text-xs font-bold uppercase">Item / Description</th>
+                                                <th className="px-4 py-2 text-left text-xs font-bold uppercase">Code</th>
                                                 <th className="px-4 py-2 text-center text-xs font-bold uppercase">Qty</th>
                                                 <th className="px-4 py-2 text-right text-xs font-bold uppercase">Price</th>
                                                 <th className="px-4 py-2 text-right text-xs font-bold uppercase">Total</th>
@@ -1801,7 +1951,12 @@ export const QuotationFlow: React.FC = () => {
                                         <tbody className="bg-white divide-y divide-orange-50">
                                             {hardwareItems.map((item, index) => (
                                                 <tr key={item.id}>
-                                                    <td className="px-4 py-2 text-sm text-slate-800 font-medium">{item.description} <span className="text-xs text-slate-400">({item.originalCode})</span></td>
+                                                    <td className="px-4 py-2 text-sm text-slate-800 font-bold font-mono">
+                                                        {item.originalCode}
+                                                        {item.description && item.description !== item.originalCode && (
+                                                            <div className="text-[10px] text-slate-400 font-sans font-normal">{item.description}</div>
+                                                        )}
+                                                    </td>
                                                     <td className="px-4 py-2 text-center text-sm">{item.quantity}</td>
                                                     <td className="px-4 py-2 text-right text-sm">${item.finalUnitPrice.toLocaleString()}</td>
                                                     <td className="px-4 py-2 text-right text-sm font-bold">${item.totalPrice.toLocaleString()}</td>
@@ -1831,7 +1986,7 @@ export const QuotationFlow: React.FC = () => {
                                     <table className="min-w-full divide-y divide-purple-100">
                                         <thead className="bg-purple-50/50 text-purple-500">
                                             <tr>
-                                                <th className="px-4 py-2 text-left text-xs font-bold uppercase">Item / Description</th>
+                                                <th className="px-4 py-2 text-left text-xs font-bold uppercase">Code</th>
                                                 <th className="px-4 py-2 text-center text-xs font-bold uppercase">Qty</th>
                                                 <th className="px-4 py-2 text-right text-xs font-bold uppercase">Price</th>
                                                 <th className="px-4 py-2 text-right text-xs font-bold uppercase">Total</th>
@@ -1841,7 +1996,12 @@ export const QuotationFlow: React.FC = () => {
                                         <tbody className="bg-white divide-y divide-purple-50">
                                             {finishingItems.map((item, index) => (
                                                 <tr key={item.id}>
-                                                    <td className="px-4 py-2 text-sm text-slate-800 font-medium">{item.description} <span className="text-xs text-slate-400">({item.originalCode})</span></td>
+                                                    <td className="px-4 py-2 text-sm text-slate-800 font-bold font-mono">
+                                                        {item.originalCode}
+                                                        {item.description && item.description !== item.originalCode && (
+                                                            <div className="text-[10px] text-slate-400 font-sans font-normal">{item.description}</div>
+                                                        )}
+                                                    </td>
                                                     <td className="px-4 py-2 text-center text-sm">{item.quantity}</td>
                                                     <td className="px-4 py-2 text-right text-sm">${item.finalUnitPrice.toLocaleString()}</td>
                                                     <td className="px-4 py-2 text-right text-sm font-bold">${item.totalPrice.toLocaleString()}</td>

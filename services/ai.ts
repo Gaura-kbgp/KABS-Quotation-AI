@@ -17,6 +17,7 @@ INPUT: Either extracted text from a PDF OR a sequence of images.
 OUTPUT: A JSON object with "scratchpad", "specs", and "items".
 
 ### **CRITICAL INSTRUCTION FOR ROOM NAMES**
+- **USE HINTS**: If a "HINT: DETECTED ROOM NAMES" block is provided, YOU MUST USE THOSE EXACT NAMES.
 - **EXTRACT EXACTLY**: You must extract the room name EXACTLY as it appears on the page Title Block or Room Label.
 - **NO NORMALIZATION**: 
     - If the PDF says "MAGNOLIA OPT GOURMET KITCHEN", output "MAGNOLIA OPT GOURMET KITCHEN".
@@ -308,7 +309,8 @@ function extractFromChunk(chunk: string, items: CabinetItem[], pageNum: string, 
             // REMOVED 'elevation' and 'plan' from exclusion list because "FLOOR PLAN" or "ELEVATION A" can be valid context
             const isInstruction = /install|refer|note|see|drawing|scale|detail|section/i.test(line); 
             // Removed 'cabinet' from exclusion because "KITCHEN CABINET PLAN" is a valid header
-            const isItem = /base|wall|tall|drawer|hinge|filler|faucet|sink|knob|pull|price|total|qty|quantity/i.test(line);
+            // FIX: Use word boundaries to prevent "Basement" matching "base", "Wallace" matching "wall"
+            const isItem = /\b(base|wall|tall|drawer|hinge|filler|faucet|sink|knob|pull|price|total|qty|quantity)\b/i.test(line);
             // Strict code check: Must start with 1-3 letters followed IMMEDIATELEY by a digit (e.g. W3042, B15). 
             // This avoids flagging "UNIT 204" or "STANDARD KITCHEN" as codes.
             const isCode = /^[A-Z]{1,3}\d/.test(line); 
@@ -658,6 +660,21 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
              // --- INSTANT LOCAL EXTRACTION (BYPASS AI) ---
              localItems = tryLocalRegexExtraction(rawText);
              
+             // Extract unique room names to guide AI
+             const detectedRooms = new Set<string>();
+             localItems.forEach(i => {
+                 if (i.room && i.room !== "Unknown Room" && i.room !== "General") detectedRooms.add(i.room);
+             });
+             
+             if (detectedRooms.size > 0) {
+                 console.log("Local Regex detected rooms:", Array.from(detectedRooms));
+                 contentsParts.push({ text: `*** HINT: DETECTED ROOM NAMES ***
+                 The following architectural room names were found in the document text. 
+                 Please use these EXACT names for your room grouping where applicable:
+                 ${Array.from(detectedRooms).map(r => `- ${r}`).join('\n')}
+                 ***` });
+             }
+             
              // DISABLE FAST SCAN BYPASS: User reported accuracy issues. 
              // We will use localItems as a backup/baseline but ALWAYS consult AI for "Deep Scan".
              if (localItems.length >= 1) {
@@ -749,6 +766,8 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
                         const isSchedule = (/schedule|legend|bill|material|list/i.test(lower)) && (/qty|quantity|desc/i.test(lower));
                         
                         // Weak Signal: "Elevation" or just "Kitchen"
+                        // Only count as Room if we also see potential cabinet codes (e.g. B30, W30) to avoid text-only specs
+                        const hasCodes = /[BW]\d{2}/.test(pContent); 
                         const isElevation = /elevation|view/i.test(lower);
                         const isRoom = /kitchen|bath/i.test(lower);
                         const hasScale = /scale:/i.test(lower);
@@ -768,7 +787,8 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
                                 }
                             } else if (isFloorPlan) {
                                 priorityPages.add(pNum);
-                            } else if (isElevation || (isRoom && hasScale)) {
+                            } else if ((isElevation || isRoom) && (hasScale || hasCodes)) {
+                                // Only add secondary pages if they look like drawings (Scale) or have codes
                                 secondaryPages.add(pNum);
                             }
                         }
@@ -781,20 +801,20 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
                     
                     // Only use secondary pages if we have FEW floor plans (e.g. just cover + 1)
                     // Or if the user wants "Deep Scan" (we are implicit here)
-                    if (finalPages.length <= 3 && secondaryPages.size > 0) {
+                    if (finalPages.length <= 2 && secondaryPages.size > 0) {
                         console.log("Smart Scan: Few Floor Plans found. Supplementing with Elevations.");
                         const secondaryArray = Array.from(secondaryPages).sort((a,b) => a - b);
-                        // Add up to 5 secondary pages
-                        finalPages = [...finalPages, ...secondaryArray.slice(0, 5)].sort((a,b) => a - b);
+                        // Add up to 3 secondary pages (Reduced from 5)
+                        finalPages = [...finalPages, ...secondaryArray.slice(0, 3)].sort((a,b) => a - b);
                     }
                     
                     pagesToRender = finalPages;
                     
-                    // Cap at 15 pages for Fast Deep Scan (User Requirement: < 1 min)
-                    // 25 pages was causing > 1 min latency. 15 pages with 2048px should be ~30s.
-                    if (pagesToRender.length > 15) {
-                        console.log(`Smart Scan: Too many pages (${pagesToRender.length}). Truncating to top 15.`);
-                        pagesToRender = pagesToRender.slice(0, 15);
+                    // Cap at 8 pages for Fast Deep Scan (User Requirement: < 1 min)
+                    // Reduced from 10 to 8 to ensure speed on large files while keeping key content.
+                    if (pagesToRender.length > 8) {
+                        console.log(`Smart Scan: Too many pages (${pagesToRender.length}). Truncating to top 8.`);
+                        pagesToRender = pagesToRender.slice(0, 8);
                     }
                     
                     // --- SMART TEXT INJECTION ---
@@ -831,16 +851,16 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
                 // SAFETY NET: If Smart Scan failed (no text or no keywords found), 
                 // DO NOT render all 100 pages. Default to a safe subset.
                 if (pagesToRender.length === 0) {
-                     console.warn("Smart Scan: No specific pages identified (or text extraction failed). Defaulting to first 10 pages.");
-                     // Create array [1, 2, ... 10]
-                     pagesToRender = Array.from({ length: 10 }, (_, i) => i + 1);
+                     console.warn("Smart Scan: No specific pages identified (or text extraction failed). Defaulting to first 8 pages.");
+                     // Create array [1, 2, ... 8]
+                     pagesToRender = Array.from({ length: 8 }, (_, i) => i + 1);
                 }
 
                 // FINAL CAP: Ensure we never accidentally request too many pages
                 // even if logic above went wrong.
-                if (pagesToRender.length > 10) {
-                     console.log(`Deep Scan: Capping page count at 10 (requested ${pagesToRender.length}) for performance.`);
-                     pagesToRender = pagesToRender.slice(0, 10);
+                if (pagesToRender.length > 8) {
+                     console.log(`Deep Scan: Capping page count at 8 (requested ${pagesToRender.length}) for performance.`);
+                     pagesToRender = pagesToRender.slice(0, 8);
                 }
 
                 // Mark rendered pages as covered

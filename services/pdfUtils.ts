@@ -43,19 +43,15 @@ export async function extractTextFromPdf(file: File): Promise<string> {
             for (let j = i; j <= end; j++) {
                 chunkPromises.push(pdf.getPage(j).then(async (page) => {
                     const textContent = await page.getTextContent();
-                    const text = textContent.items.map((item: any) => item.str).join(' ');
+                    const text = textContent.items.map((item: any) => item.str).join('\n');
                     // Add delimiter for page splitting in AI service
                     return `--- PAGE ${j} ---\n${text}\n`;
                 }));
             }
             
             const results = await Promise.all(chunkPromises);
-            // Maintain order within chunk
-            results.sort((a, b) => {
-                const pageA = parseInt(a.match(/--- PAGE (\d+) ---/)?.[1] || "0");
-                const pageB = parseInt(b.match(/--- PAGE (\d+) ---/)?.[1] || "0");
-                return pageA - pageB;
-            }).forEach(r => textPages.push(r));
+            // Promise.all preserves order, so we can just push results
+            textPages.push(...results);
             
             // Minimal delay for text extraction
             if (i + CHUNK_SIZE <= numPages) await new Promise(resolve => setTimeout(resolve, 5));
@@ -91,8 +87,8 @@ export async function convertPdfToImages(file: File, pagesToRender?: number[]): 
 
         // Process pages in chunks to prevent UI freezing and browser crashes
         // Rendering high-res canvases is expensive.
-        // INCREASED CHUNK SIZE for 100-page speed optimization
-        const CHUNK_SIZE = 5; 
+        // INCREASED CHUNK SIZE for 100-page speed optimization (10 pages per batch)
+        const CHUNK_SIZE = 10; 
         const results: (PDFPageImage | null)[] = [];
 
         for (let i = 0; i < pageNumbers.length; i += CHUNK_SIZE) {
@@ -103,16 +99,16 @@ export async function convertPdfToImages(file: File, pagesToRender?: number[]): 
                 try {
                     const page = await pdf.getPage(pageNum);
                     
-                    // Scale logic: Balanced quality for AI (2048px is standard for high-res LLM vision speed)
-                    // Target max dimension ~2048px to ensure legibility of small cabinet codes
-                    // 1600px was too blurry for some "W3042 BUTT" labels.
+                    // Scale logic: Balanced quality for AI
+                    // Target max dimension ~1400px to ensure legibility while maximizing speed.
+                    // 1600px was good, but 1400px is faster and sufficient for "BUTT" suffixes.
                     let scale = 3.0; 
                     const unscaledViewport = page.getViewport({ scale: 1.0 });
                     const maxDim = Math.max(unscaledViewport.width, unscaledViewport.height);
                     
-                    // Limit to 2048px
-                    if (maxDim * scale > 2048) {
-                        scale = 2048 / maxDim;
+                    // Limit to 1400px
+                    if (maxDim * scale > 1400) {
+                        scale = 1400 / maxDim;
                     }
                     
                     const viewport = page.getViewport({ scale });
@@ -130,9 +126,9 @@ export async function convertPdfToImages(file: File, pagesToRender?: number[]): 
                         viewport: viewport
                     } as any).promise;
 
-                    // Convert to JPEG with quality 0.7 (Good Web Quality)
-                    // Increased from 0.5 to 0.7 to improve text sharpness for OCR
-                    const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
+                    // Convert to JPEG with quality 0.6 (Good Web Quality)
+                    // Reduced from 0.7 to 0.6 to speed up processing and reduce payload size
+                    const dataUrl = canvas.toDataURL('image/jpeg', 0.6);
                     
                     // Strip prefix
                     const cleanData = dataUrl.split(',')[1];
@@ -154,8 +150,8 @@ export async function convertPdfToImages(file: File, pagesToRender?: number[]): 
             const chunkResults = await Promise.all(chunkPromises);
             results.push(...chunkResults);
             
-            // Reduced delay to 10ms (was 50ms) to speed up batch processing
-            await new Promise(resolve => setTimeout(resolve, 10));
+            // Reduced delay to 2ms (was 5ms) to speed up batch processing
+            await new Promise(resolve => setTimeout(resolve, 2));
         }
         
         // Filter out any failed pages (nulls) and sort by page number to be safe
