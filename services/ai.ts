@@ -23,11 +23,22 @@ INTELLIGENCE RULES:
     - If multiple Kitchens exist, number them: "Kitchen 1", "Kitchen 2".
     - If multiple Bathrooms exist, number them: "Bath 1", "Bath 2".
     - Assign the "room" field for EVERY item. Default to "General" if unknown.
-3.  **Find Codes**: Identify cabinet codes (e.g., "B30", "W3030", "VDB27", "SB36").
-4.  **Infer Missing Codes**: If a cabinet has dimensions but no code (e.g., a 30" wide Base), construct the code "B30". Use "W{width}{height}" for walls.
-5.  **Filter Noise**: Exclude appliances (Fridge, Stove, DW) unless they are cabinet enclosures/panels. Exclude electrical/plumbing symbols.
-6.  **Grouping**: Group findings by page in the "scratchpad" field.
-7.  **Deduplicate**: If the SAME cabinet appears multiple times (e.g. Plan vs Elevation), count it ONLY ONCE.
+3.  **Find Codes & Count Accurately (FLOOR PLAN PRIORITY)**: 
+    - **CRITICAL**: The Floor Plan drawing is the source of truth for QUANTITY.
+    - **DEEP SCAN**: You must scan the ENTIRE floor plan, wall by wall, island by island.
+    - **EVERY LABEL MATTERS**: If you see the label "W3042" written 4 times, the quantity is 4. Do not group them yet. List them individually in the scratchpad.
+    - **SUFFIXES ARE KEY**: "W3042 BUTT" is different from "W3042". "B15 L" is different from "B15 R". Capture the FULL code.
+    - **IGNORE** text summaries if they conflict with the visual count on the floor plan.
+    - **Common Suffixes**: BUTT, L, R, FH (Full Height), FE (Finished End), M (Modified), P (Prep).
+4.  **NKBA Categorization (MANDATORY)**:
+    - **Base Cabinets**: Codes starting with 'B', 'SB' (Sink Base), 'DB' (Drawer Base), 'LS' (Lazy Susan), 'VSB' (Vanity Sink Base). Type = "Base".
+    - **Wall Cabinets**: Codes starting with 'W', 'DC' (Diagonal Corner), 'WDC'. Type = "Wall".
+    - **Tall Cabinets**: Codes starting with 'T', 'U' (Utility), 'O' (Oven), 'P' (Pantry). Type = "Tall".
+    - **Appliances**: Fridge, Refrigerator, Range, Stove, Oven, Microwave, Dishwasher (DW), Hood, Wine Cooler. Type = "Appliance".
+    - **Hardware**: Hinges, Glides, Joints, Fillers, Toe Kicks, Skins, Panels, Moldings, Valance, Corbel, Leg, Rod. Type = "Hardware".
+5.  **Infer Missing Codes**: If a cabinet has dimensions but no code (e.g., a 30" wide Base), construct the code "B30". Use "W{width}{height}" for walls.
+6.  **Filter Noise**: Do not extract electrical outlets (symbols with $, GFI), plumbing pipes, or dimensions lines as items.
+7.  **Grouping**: Group findings by page in the "scratchpad" field.
 8.  **Text Mode**: If analyzing raw text, assume it is a Cabinet List/Quote. Extract the codes and quantities directly.
 
 Your extraction must be exhaustive and accurate.
@@ -254,7 +265,8 @@ function extractFromChunk(chunk: string, items: CabinetItem[], pageNum: string, 
     // 2. Digits: 1 or more (e.g. 8 in BTK8, 30 in B30)
     // 3. Optional attached suffix: Letters only (e.g. H in VSB3634H, L in B30L)
     // 4. Separator + Suffixes: Space or dash, followed by alphanumeric (e.g. " BUTT", " 2B", " 2X4X96")
-    const codeRegex = /\b([A-Z]{1,5}\d{1,}[A-Z]*(?:[\s-][A-Z0-9\/]+)*)\b/g;
+    // Modified to allow multiple spaces/dashes as separators
+    const codeRegex = /\b([A-Z]{1,5}\d{1,}[A-Z]*(?:[\s-]+[A-Z0-9\/]+)*)\b/g;
 
     const lines = chunk.split('\n');
     
@@ -496,13 +508,20 @@ function extractFromChunk(chunk: string, items: CabinetItem[], pageNum: string, 
             if (code.includes("PHONE") || code.includes("FAX")) continue;
             if (["PAGE", "ITEM", "NOTE", "DATE", "TIME", "TOTAL", "SUBTOTAL", "QTY", "PRICE", "AMOUNT"].includes(code)) continue;
             // Filter out explicit appliance codes/descriptions that might be picked up
-            if (/^(DISHWASHER|MICROWAVE|OVEN|FRIDGE|REFRIGERATOR|RANGE|HOOD|COOKTOP|WASHER|DRYER|APPLIANCE)/i.test(code)) continue;
-
             // Basic Type Inference
             let type: CabinetType = 'Base';
-            if (code.startsWith('W')) type = 'Wall';
+            
+            // Check for Appliances first (previously filtered out)
+            if (/^(DISHWASHER|MICROWAVE|OVEN|FRIDGE|REFRIGERATOR|RANGE|HOOD|COOKTOP|WASHER|DRYER|APPLIANCE|REF|DW|MW)/i.test(code)) {
+                type = 'Appliance';
+            }
+            // Check for Hardware
+            else if (/^(HINGE|GLIDE|TRACK|JOINT|FILLER|MOLDING|TOE|TK|VALANCE)/i.test(code)) {
+                type = 'Hardware';
+            }
+            else if (code.startsWith('W')) type = 'Wall';
             else if (code.startsWith('T') || code.startsWith('U') || code.startsWith('O')) type = 'Tall';
-            else if (code.startsWith('V') || code.startsWith('B') && code.includes('VAN')) type = 'Accessory'; // Vanities?
+            else if (code.startsWith('V') || (code.startsWith('B') && code.includes('VAN'))) type = 'Accessory'; // Vanities?
             else if (code.startsWith('D') && !code.startsWith('DB')) type = 'Accessory'; // Drawer fronts?
             
             // --- EXTRACT DESCRIPTION ---
@@ -525,6 +544,8 @@ function extractFromChunk(chunk: string, items: CabinetItem[], pageNum: string, 
                 if (type === 'Base') description = `Base Cabinet ${code.match(/\d+/)?.[0] || ""}"`;
                 else if (type === 'Wall') description = `Wall Cabinet ${code.match(/\d+/)?.[0] || ""}"`;
                 else if (type === 'Tall') description = `Tall Cabinet ${code.match(/\d+/)?.[0] || ""}"`;
+                else if (type === 'Appliance') description = `Appliance: ${code}`;
+                else if (type === 'Hardware') description = `Hardware: ${code}`;
                 else if (type === 'Accessory') description = `Accessory/Part ${code}`;
                 else description = "Cabinet Item";
             }
@@ -823,18 +844,11 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
              
              // --- INSTANT LOCAL EXTRACTION (BYPASS AI) ---
              const localItems = tryLocalRegexExtraction(rawText);
-             // LOWERED THRESHOLD: If we find even ONE valid item via regex, trust it and return immediately.
-             // This is the "Fast Scan" promise.
+             
+             // DISABLE FAST SCAN BYPASS: User reported accuracy issues. 
+             // We will use localItems as a backup/baseline but ALWAYS consult AI for "Deep Scan".
              if (localItems.length >= 1) {
-                 console.log(`INSTANT SCAN SUCCESS: Found ${localItems.length} items using local regex. Bypassing AI.`);
-                 // Return immediately with locally found items
-                 return {
-                     specs: {
-                         manufacturer: "Detected from PDF (Fast Scan)",
-                         notes: "Extracted via Fast Scan"
-                     },
-                     items: consolidateItems(localItems)
-                 };
+                 console.log(`Local Scan found ${localItems.length} items. Proceeding to AI for verification (Deep Scan).`);
              }
              // --------------------------------------------
 
@@ -850,37 +864,100 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
              const isRichText = rawText.length > 200;
              const seemsLikeList = (codeMatches.length > 5) || (codeMatches.length > 2 && hasListKeywords);
 
-             if (isRichText && seemsLikeList) {
-                  console.log(`Fast Path: Detected ${codeMatches.length} potential codes. Skipping Image Rasterization.`);
+             if (isRichText) { // Always provide text if available
+                  console.log(`Fast Path: Detected ${codeMatches.length} potential codes. Adding Text Context.`);
                   
                   // Optimize Text: Collapse multiple spaces to one, but PRESERVE NEWLINES for list structure
                   const optimizedText = rawText.replace(/[ \t]+/g, ' ').replace(/\n\s*\n/g, '\n');
                   
-                  contentsParts.push({ text: `*** DOCUMENT TEXT EXTRACTED (OPTIMIZED) ***
-                  The user uploaded a PDF that contains readable text (likely an Order Acknowledgment or Quote). 
-                  Below is the raw text content of the file.
-                  
-                  CRITICAL INSTRUCTION:
-                  1. Scan the ENTIRE text below.
-                  2. Extract ALL cabinet codes found in the text.
-                  3. IGNORE page headers/footers if they are just metadata.
-                  4. Note that the text may contain multiple pages separated by "--- PAGE X ---". You must read ALL pages.
+                  contentsParts.push({ text: `*** DOCUMENT TEXT EXTRACTED (HINT ONLY) ***
+                  The user uploaded a PDF. Below is the raw text content extracted programmatically.
+                  Use this text to help identify codes that might be blurry in images.
+                  HOWEVER, RELY ON THE IMAGES FOR COUNTS AND SPATIAL LOCATION (Floor Plan).
                   
                   RAW TEXT CONTENT:
                   ${optimizedText}
                   ***` });
                   
-                  processedWithText = true;
+                  // We DO NOT set processedWithText = true anymore, because we want images too.
              }
         } catch (textErr) {
              console.warn("Text extraction failed/inadequate, continuing to image processing...", textErr);
         }
 
-        // 2. SLOW PATH: Vision Analysis (Fallback)
-        if (!processedWithText) {
+        // 2. DEEP SCAN: Vision Analysis (Smart Hybrid Mode)
+        if (true) { // Always run vision, but strictly optimized
             try {
-                console.log("Detecting PDF... Converting pages to images for improved AI recall...");
-                const pdfImages = await convertPdfToImages(file);
+                console.log("Deep Scan: determining pages to render...");
+                
+                let pagesToRender: number[] = [];
+                let totalPages = 0;
+
+                // Smart Page Selection Logic
+                // If we have text, we can be smart about which pages to render.
+                if (processedWithText && contentsParts.length > 0) {
+                     // The first part is usually the text part
+                     const textPart = contentsParts.find(p => p.text && p.text.includes("*** DOCUMENT TEXT EXTRACTED"));
+                     if (textPart) {
+                         const fullText = textPart.text;
+                         // Split by page markers
+                         const pageSplits = fullText.split(/--- PAGE (\d+) ---/i);
+                         // pageSplits = ["pre", "1", "content", "2", "content"...]
+                         
+                         // Determine total pages from the last index found
+                         if (pageSplits.length > 1) {
+                             const lastPageStr = pageSplits[pageSplits.length - 2]; // Second to last is the number
+                             totalPages = parseInt(lastPageStr) || 0;
+                         }
+
+                         // Strategy:
+                         // 1. ALWAYS render pages 1-3 (Cover sheet, Index, Initial Plans)
+                         // 2. Render pages with "Kitchen", "Bath", "Plan", "Elevation", "Scale" keywords
+                         // 3. Skip pages with "Warranty", "Maintenance", "Terms" if they don't have plan keywords
+                         
+                         const interestingPages = new Set<number>();
+                         
+                         // Add first 3 pages
+                         [1, 2, 3].forEach(p => interestingPages.add(p));
+
+                         // Analyze text content for each page
+                         for (let i = 1; i < pageSplits.length; i += 2) {
+                             const pNum = parseInt(pageSplits[i]);
+                             const pContent = pageSplits[i+1] || "";
+                             const lower = pContent.toLowerCase();
+
+                             // Keywords that suggest a Drawing/Plan
+                             const isPlan = /scale:|elevation|floor plan|plan view|layout|kitchen|bath/i.test(lower);
+                             
+                             // Keywords that suggest a Spec/Text page (only skip if NOT a plan)
+                             const isSpec = /warranty|maintenance|terms and conditions|specifications/i.test(lower);
+
+                             if (isPlan) {
+                                 interestingPages.add(pNum);
+                             }
+                         }
+                         
+                         pagesToRender = Array.from(interestingPages).sort((a,b) => a - b);
+                         
+                         // Cap at 15 pages to keep it under 1 minute
+                         if (pagesToRender.length > 15) {
+                             console.log(`Smart Scan: Too many interesting pages (${pagesToRender.length}). Truncating to first 15.`);
+                             pagesToRender = pagesToRender.slice(0, 15);
+                         }
+                         
+                         console.log(`Smart Scan: Identified ${pagesToRender.length} relevant pages to render: ${pagesToRender.join(', ')}`);
+                     }
+                }
+
+                // If we failed to determine pages (no text or parsing error), or if total pages is small (<10), just render all (or first 15)
+                if (pagesToRender.length === 0) {
+                     // We don't know total pages yet without loading PDF, so we pass undefined to render all, 
+                     // but convertPdfToImages will handle the "limit" if we don't pass specific pages.
+                     // Actually, let's just let convertPdfToImages handle it if we don't know.
+                }
+
+                console.log("Deep Scan: Converting pages to images for AI...");
+                const pdfImages = await convertPdfToImages(file, pagesToRender.length > 0 ? pagesToRender : undefined);
                 
                 if (pdfImages.length === 0) {
                     throw new Error("PDF processing failed: No pages found.");
@@ -888,29 +965,23 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
 
                 console.log(`Successfully converted ${pdfImages.length} PDF pages to images.`);
 
-                // OPTIMIZATION: If too many pages (>50), fallback to text-only mode for the remaining pages or warn user
-                // User requested FULL SCAN of large docs, so we increased limit from 15 to 50.
-                const MAX_IMAGES = 50;
-                const imagesToProcess = pdfImages.slice(0, MAX_IMAGES);
-
-                contentsParts.push({ text: `*** DOCUMENT INFO: This PDF contains ${pdfImages.length} pages. 
-                Processing first ${imagesToProcess.length} pages as images for high precision.
+                // Add document info
+                contentsParts.push({ text: `*** DOCUMENT INFO: 
+                Processing ${pdfImages.length} selected pages as IMAGES for visual analysis.
+                (Pages: ${pdfImages.map(p => p.pageNumber).join(', ')})
                 
                 CRITICAL INSTRUCTION:
                 You MUST iterate through ALL provided images.
-                You MUST extract cabinets from EACH page. 
+                The images provided are the MOST RELEVANT pages (Floor Plans, Elevations).
+                Use the previously provided TEXT HINT for the remaining pages if needed.
                 
                 REQUIRED SCRATCHPAD FORMAT:
-                You must start your scratchpad with:
-                "Analyzing Page 1..."
-                [findings for page 1]
-                "Analyzing Page 2..."
-                [findings for page 2]
-                ...and so on.
+                "Analyzing Page X..."
+                [findings]
                 ***` });
 
                 // Add each page as a separate image part
-                imagesToProcess.forEach(img => {
+                pdfImages.forEach(img => {
                     contentsParts.push({
                         inlineData: {
                             mimeType: img.mimeType,
@@ -921,10 +992,6 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
                     contentsParts.push({ text: `[--- IMAGE FOR PAGE ${img.pageNumber} ---]` });
                 });
                 
-                if (pdfImages.length > MAX_IMAGES) {
-                     contentsParts.push({ text: `[--- WARNING: DOCUMENT TRUNCATED AT PAGE ${MAX_IMAGES}. USER HAS MORE PAGES BUT SYSTEM LIMIT REACHED ---]` });
-                }
-
             } catch (pdfErr) {
                 console.error("PDF Rasterization failed. Falling back to raw PDF upload.", pdfErr);
                 // Fallback: Upload raw PDF if rasterization fails
@@ -1137,6 +1204,8 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
             else if (rawType.includes('tall') || rawType.includes('pantry') || code.startsWith('U') || code.startsWith('T')) type = 'Tall';
             else if (rawType.includes('filler')) type = 'Filler';
             else if (rawType.includes('panel') || rawType.includes('skin')) type = 'Panel';
+            else if (rawType.includes('hardware') || rawType.includes('hinge') || rawType.includes('glide') || rawType.includes('joint')) type = 'Hardware';
+            else if (rawType.includes('appliance') || rawType.includes('fridge') || rawType.includes('range') || rawType.includes('dishwasher')) type = 'Appliance';
             else if (rawType.includes('accessory') || rawType.includes('molding') || rawType.includes('kit') || rawType.includes('toe')) type = 'Accessory';
             else type = 'Base'; // Default
 

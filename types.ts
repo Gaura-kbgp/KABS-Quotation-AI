@@ -1,6 +1,6 @@
 
 
-export type CabinetType = 'Base' | 'Wall' | 'Tall' | 'Panel' | 'Filler' | 'Accessory' | 'Modification';
+export type CabinetType = 'Base' | 'Wall' | 'Tall' | 'Panel' | 'Filler' | 'Accessory' | 'Modification' | 'Appliance' | 'Hardware';
 
 export interface CabinetModification {
   description: string;

@@ -8,7 +8,7 @@ const Home = lazy(() => import('./views/Home').then(module => ({ default: module
 const Admin = lazy(() => import('./views/Admin').then(module => ({ default: module.Admin })));
 const Login = lazy(() => import('./views/Login').then(module => ({ default: module.Login })));
 const QuotationFlow = lazy(() => import('./views/QuotationFlow').then(module => ({ default: module.QuotationFlow })));
-const DrawingAI = lazy(() => import('./views/DrawingAI').then(module => ({ default: module.DrawingAI })));
+const DesignAI = lazy(() => import('./views/DesignAI').then(module => ({ default: module.DesignAI })));
 
 const LoadingSpinner = () => (
   <div className="flex h-screen w-full items-center justify-center">
@@ -26,7 +26,7 @@ const App: React.FC = () => {
             <Route path="/login" element={<Login />} />
             <Route path="/admin" element={<Admin />} />
             <Route path="/quote" element={<QuotationFlow />} />
-            <Route path="/drawing-ai" element={<DrawingAI />} />
+            <Route path="/design-ai" element={<DesignAI />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </Suspense>

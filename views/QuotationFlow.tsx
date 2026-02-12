@@ -1558,14 +1558,21 @@ export const QuotationFlow: React.FC = () => {
                         {/* REMOVED: Catalog Item Adder Dropdowns as per user request */}
 
                         {(() => {
+                            // 1. Separate Items by Category
+                            const cabinetItems = project.pricing.filter(i => i.type !== 'Appliance' && i.type !== 'Hardware');
+                            const hardwareItems = project.pricing.filter(i => i.type === 'Hardware');
+                            const applianceItems = project.pricing.filter(i => i.type === 'Appliance');
+
+                            // 2. Group Cabinets by Room
                             const groups: Record<string, PricingLineItem[]> = {};
-                            project.pricing.forEach(item => {
+                            cabinetItems.forEach(item => {
                                 const room = item.room || "General";
                                 if (!groups[room]) groups[room] = [];
                                 groups[room].push(item);
                             });
 
-                            return Object.entries(groups).map(([roomName, items]) => (
+                            // 3. Render Cabinet Groups
+                            const cabinetSections = Object.entries(groups).map(([roomName, items]) => (
                                 <div key={roomName} className="mb-8 border border-slate-200 rounded-lg overflow-hidden">
                                     <div className="bg-slate-100 px-4 py-3 border-b border-slate-200 flex justify-between items-center">
                                         <div className="flex items-center gap-4">
@@ -1647,7 +1654,7 @@ export const QuotationFlow: React.FC = () => {
                                                         <button 
                                                             onClick={() => deleteProjectItem(item.id)}
                                                             className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors"
-                                                            title="Delete Item"
+                                                            title="Remove Item"
                                                         >
                                                             <Trash2 className="w-4 h-4" />
                                                         </button>
@@ -1663,6 +1670,74 @@ export const QuotationFlow: React.FC = () => {
                                     </div>
                                 </div>
                             ));
+
+                            // 4. Render Hardware Section (if any)
+                            const hardwareSection = hardwareItems.length > 0 ? (
+                                <div key="hardware-section" className="mb-8 border border-orange-200 rounded-lg overflow-hidden">
+                                    <div className="bg-orange-50 px-4 py-3 border-b border-orange-200 flex justify-between items-center">
+                                        <div className="flex items-center gap-2">
+                                            <Hammer className="w-4 h-4 text-orange-600" />
+                                            <h3 className="font-bold text-orange-900">Hardware & Accessories</h3>
+                                            <span className="bg-orange-200 text-orange-800 px-2 py-0.5 rounded-full text-xs font-medium">{hardwareItems.length} items</span>
+                                        </div>
+                                        <span className="text-sm font-bold text-orange-900">
+                                            Subtotal: <span className="text-orange-950">${hardwareItems.reduce((acc, i) => acc + i.totalPrice, 0).toLocaleString()}</span>
+                                        </span>
+                                    </div>
+                                    <table className="min-w-full divide-y divide-orange-100">
+                                         {/* Simplified Table for Hardware */}
+                                         <thead className="bg-orange-50/50 text-orange-500">
+                                            <tr>
+                                                <th className="px-4 py-2 text-left text-xs font-bold uppercase">Item</th>
+                                                <th className="px-4 py-2 text-center text-xs font-bold uppercase">Qty</th>
+                                                <th className="px-4 py-2 text-right text-xs font-bold uppercase">Price</th>
+                                                <th className="px-4 py-2 text-right text-xs font-bold uppercase">Total</th>
+                                                <th className="px-4 py-2 w-10"></th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="bg-white divide-y divide-orange-50">
+                                            {hardwareItems.map((item, index) => (
+                                                <tr key={item.id}>
+                                                    <td className="px-4 py-2 text-sm text-slate-800 font-medium">{item.description} <span className="text-xs text-slate-400">({item.originalCode})</span></td>
+                                                    <td className="px-4 py-2 text-center text-sm">{item.quantity}</td>
+                                                    <td className="px-4 py-2 text-right text-sm">${item.finalUnitPrice.toLocaleString()}</td>
+                                                    <td className="px-4 py-2 text-right text-sm font-bold">${item.totalPrice.toLocaleString()}</td>
+                                                    <td className="px-4 py-2 text-center">
+                                                        <button onClick={() => deleteProjectItem(item.id)} className="text-slate-400 hover:text-red-500"><Trash2 className="w-3 h-3"/></button>
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            ) : null;
+
+                            // 5. Render Appliances Section (Excluded Items)
+                            const applianceSection = applianceItems.length > 0 ? (
+                                <div key="appliance-section" className="mb-8 border border-slate-200 border-dashed rounded-lg overflow-hidden opacity-75">
+                                    <div className="bg-slate-50 px-4 py-2 border-b border-slate-200 flex justify-between items-center">
+                                        <div className="flex items-center gap-2">
+                                            <AlertCircle className="w-4 h-4 text-slate-400" />
+                                            <h3 className="font-bold text-slate-600">Appliances (Not Quoted)</h3>
+                                            <span className="bg-slate-200 text-slate-500 px-2 py-0.5 rounded-full text-xs font-medium">{applianceItems.length} found</span>
+                                        </div>
+                                    </div>
+                                    <div className="p-4 bg-slate-50/50 flex flex-wrap gap-2">
+                                        {applianceItems.map(item => (
+                                            <span key={item.id} className="inline-flex items-center gap-1 px-3 py-1 rounded-full bg-white border border-slate-200 text-xs font-medium text-slate-600 shadow-sm">
+                                                {item.originalCode} 
+                                                <span className="text-slate-400">({item.quantity})</span>
+                                            </span>
+                                        ))}
+                                    </div>
+                                </div>
+                            ) : null;
+
+                            return [
+                                ...cabinetSections, 
+                                hardwareSection, 
+                                applianceSection
+                            ];
                         })()}
                     </div>
                     

@@ -3,7 +3,7 @@ import { ArrowLeft, Construction, Sparkles } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { Button } from '../components/Button';
 
-export const DrawingAI: React.FC = () => {
+export const DesignAI: React.FC = () => {
   const navigate = useNavigate();
   return (
     <div className="flex flex-col items-center justify-center min-h-[60vh] text-center space-y-8 animate-in fade-in duration-500 p-4">

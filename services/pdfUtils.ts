@@ -83,7 +83,7 @@ export async function extractTextFromPdf(file: File): Promise<string> {
     }
 }
 
-export async function convertPdfToImages(file: File): Promise<PDFPageImage[]> {
+export async function convertPdfToImages(file: File, pagesToRender?: number[]): Promise<PDFPageImage[]> {
     const pdfjsLib = await getPdfJs();
     const arrayBuffer = await file.arrayBuffer();
     
@@ -94,62 +94,82 @@ export async function convertPdfToImages(file: File): Promise<PDFPageImage[]> {
 
         console.log(`PDF loaded. Total pages: ${numPages}`);
 
-        // Create an array of page numbers
-        const pageNumbers = Array.from({ length: numPages }, (_, i) => i + 1);
+        // Create an array of page numbers to render
+        // If pagesToRender is provided, use it. Otherwise render all.
+        let pageNumbers: number[];
+        if (pagesToRender && pagesToRender.length > 0) {
+            pageNumbers = pagesToRender.filter(p => p >= 1 && p <= numPages);
+            console.log(`Rendering specific pages: ${pageNumbers.join(', ')}`);
+        } else {
+            pageNumbers = Array.from({ length: numPages }, (_, i) => i + 1);
+        }
 
-        // Process pages in parallel for speed
-        // We use Promise.all to render all pages concurrently
-        const renderPromises = pageNumbers.map(async (i) => {
-            try {
-                const page = await pdf.getPage(i);
-                
-                // Scale logic: Balanced quality for AI (1536px is optimal for multi-page token limits)
-                // Target max dimension ~1536px (1.5K resolution) to allow 10+ pages in context
-                let scale = 2.0;
-                const unscaledViewport = page.getViewport({ scale: 1.0 });
-                const maxDim = Math.max(unscaledViewport.width, unscaledViewport.height);
-                
-                // Limit to 1536px to prevent massive payloads with multi-page PDFs
-                if (maxDim * scale > 1536) {
-                    scale = 1536 / maxDim;
+        // Process pages in chunks to prevent UI freezing and browser crashes
+        // Rendering high-res canvases is expensive.
+        const CHUNK_SIZE = 3; 
+        const results: (PDFPageImage | null)[] = [];
+
+        for (let i = 0; i < pageNumbers.length; i += CHUNK_SIZE) {
+            const chunk = pageNumbers.slice(i, i + CHUNK_SIZE);
+            console.log(`Processing image chunk: pages ${chunk.join(', ')}`);
+            
+            const chunkPromises = chunk.map(async (pageNum) => {
+                try {
+                    const page = await pdf.getPage(pageNum);
+                    
+                    // Scale logic: Balanced quality for AI (2048px is standard for high-res LLM vision)
+                    // Target max dimension ~2048px (2K resolution) to ensure speed while keeping labels readable
+                    // Previous 3072px was too slow for client-side rendering
+                    let scale = 3.0; 
+                    const unscaledViewport = page.getViewport({ scale: 1.0 });
+                    const maxDim = Math.max(unscaledViewport.width, unscaledViewport.height);
+                    
+                    // Limit to 2048px
+                    if (maxDim * scale > 2048) {
+                        scale = 2048 / maxDim;
+                    }
+                    
+                    const viewport = page.getViewport({ scale });
+                    
+                    const canvas = document.createElement('canvas');
+                    const context = canvas.getContext('2d');
+                    
+                    if (!context) throw new Error("Canvas context not available");
+
+                    canvas.height = viewport.height;
+                    canvas.width = viewport.width;
+
+                    await page.render({
+                        canvasContext: context,
+                        viewport: viewport
+                    } as any).promise;
+
+                    // Convert to JPEG with quality 0.8 (slightly higher to compensate for lower res)
+                    const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+                    
+                    // Strip prefix
+                    const cleanData = dataUrl.split(',')[1];
+                    
+                    console.log(`Rendered page ${pageNum}/${numPages}`);
+
+                    return {
+                        pageNumber: pageNum,
+                        data: cleanData,
+                        mimeType: 'image/jpeg'
+                    } as PDFPageImage;
+
+                } catch (pageError) {
+                    console.error(`Error rendering page ${pageNum}:`, pageError);
+                    return null;
                 }
-                
-                const viewport = page.getViewport({ scale });
-                
-                const canvas = document.createElement('canvas');
-                const context = canvas.getContext('2d');
-                
-                if (!context) throw new Error("Canvas context not available");
+            });
 
-                canvas.height = viewport.height;
-                canvas.width = viewport.width;
-
-                await page.render({
-                    canvasContext: context,
-                    viewport: viewport
-                } as any).promise;
-
-                // Convert to JPEG with balanced quality (0.7 for speed/size) 
-                const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
-                
-                // Strip prefix
-                const cleanData = dataUrl.split(',')[1];
-                
-                console.log(`Rendered page ${i}/${numPages}`);
-
-                return {
-                    pageNumber: i,
-                    data: cleanData,
-                    mimeType: 'image/jpeg'
-                } as PDFPageImage;
-
-            } catch (pageError) {
-                console.error(`Error rendering page ${i}:`, pageError);
-                return null;
-            }
-        });
-
-        const results = await Promise.all(renderPromises);
+            const chunkResults = await Promise.all(chunkPromises);
+            results.push(...chunkResults);
+            
+            // Small delay to let the UI breathe
+            await new Promise(resolve => setTimeout(resolve, 50));
+        }
         
         // Filter out any failed pages (nulls) and sort by page number to be safe
         const images = results.filter((img): img is PDFPageImage => img !== null).sort((a, b) => a.pageNumber - b.pageNumber);

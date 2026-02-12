@@ -1,4 +1,4 @@
-# KABS Quotation & Drawing System
+# KABS Quotation & Design System
 
 A next-generation automated quotation system for the cabinetry industry, powered by **Gemini 2.5 AI** and **Supabase**. This application processes architectural drawings (PDF/Images), extracts cabinet specifications using computer vision/OCR, and automatically generates priced quotations by matching against manufacturer catalogs.
 

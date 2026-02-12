@@ -44,7 +44,7 @@ export const Home: React.FC = () => {
           <ArrowRight className="w-4 h-4" />
         </Button>
         
-        <Link to="/drawing-ai" className="flex-1">
+        <Link to="/design-ai" className="flex-1">
           <Button variant="outline" size="lg" className="w-full gap-2">
             <PenTool className="w-5 h-5" />
             Design AI
