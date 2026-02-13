@@ -5,9 +5,40 @@ import { normalizeNKBACode } from "./pricingEngine";
 // Using import.meta.env.VITE_GEMINI_API_KEY as per guidelines
 const getAI = () => new GoogleGenAI({ apiKey: import.meta.env.VITE_GEMINI_API_KEY });
 
-// Updated to 2.5 series as per user request (2026 models)
-const MODEL_NAME = 'gemini-2.5-flash'; // Switched to Flash for speed
-const PRO_MODEL_NAME = 'gemini-2.5-pro'; // Keep Pro as fallback/option 
+// Updated to Flash 1.5 for maximum speed (Sub-10s extraction)
+// PRIORITY: User requested 2.5/3, but since those are not public, we use 2.0 Flash/Pro experimental and fallbacks.
+const MODEL_PRIORITY = [
+    'gemini-3-pro-preview', // User requested top priority
+    'gemini-2.5-pro',       // User requested
+    'gemini-2.5-flash',     // User requested
+    'gemini-2.0-flash-exp', // Newest real fast model
+    'gemini-1.5-pro',       // High quality fallback
+    'gemini-1.5-flash',     // Standard fast model
+    'gemini-1.0-pro'        // Legacy fallback
+];
+
+// Helper to iterate through models if one fails (e.g. 404 Not Found)
+async function generateWithFallback(ai: any, contents: any, config: any) {
+    let lastError;
+    for (const model of MODEL_PRIORITY) {
+        try {
+            console.log(`Attempting AI generation with model: ${model}`);
+            const result = await ai.models.generateContent({
+                model: model,
+                contents: contents,
+                config: config
+            });
+            console.log(`Success with model: ${model}`);
+            return result;
+        } catch (error: any) {
+            console.warn(`Model ${model} failed:`, error.message || error);
+            lastError = error;
+            // specific error handling: if it's a safety block, maybe don't retry? 
+            // But for 404/503 we definitely retry next model.
+        }
+    }
+    throw lastError; // All models failed
+} 
 
 const SYSTEM_INSTRUCTION = `
 You are Design AI, an expert kitchen cabinet estimator.
@@ -15,58 +46,237 @@ You are Design AI, an expert kitchen cabinet estimator.
 GOAL: Extract EVERY cabinet code from the provided document (PDF or Images) with 100% ACCURACY.
 INPUT: Either extracted text from a PDF OR a sequence of images.
 OUTPUT: A JSON object with "scratchpad", "specs", and "items".
+- "items": Array of { originalCode, type, quantity, room, sourcePage, description, width, height, depth }
+- "sourcePage": The page number where the item was found (e.g., 1, 2, 5). CRITICAL for sorting.
 
-### **CRITICAL INSTRUCTION FOR ROOM NAMES**
-- **USE HINTS**: If a "HINT: DETECTED ROOM NAMES" block is provided, YOU MUST USE THOSE EXACT NAMES.
-- **EXTRACT EXACTLY**: You must extract the room name EXACTLY as it appears on the page Title Block or Room Label.
-- **NO NORMALIZATION**: 
-    - If the PDF says "MAGNOLIA OPT GOURMET KITCHEN", output "MAGNOLIA OPT GOURMET KITCHEN".
-    - If it says "STANDARD 42\" KITCHEN", output "STANDARD 42\" KITCHEN".
-    - If it says "Unit 505 Kitchen", output "Unit 505 Kitchen".
-    - **NEVER** simplify this to just "Kitchen" or "Kitchen 1". The user needs the EXACT architectural name.
-- **GROUP BY NAME**: All items found under a specific Title Block (e.g., "PLAN 4") must be assigned to that exact room name. Do NOT mix items from "PLAN 4" with "PLAN 5".
-- **UNIT NUMBERS**: If you see "UNIT 202" or "TYPE B", include that in the room name (e.g., "UNIT 202 KITCHEN").
+### **CRITICAL: EXCLUSION RULES (WHAT TO IGNORE)**
+❌ **DO NOT EXTRACT**:
+- **Appliances**: CKT30 (Cooktop), Dishwashers, Ranges, Microwaves, Fridges.
+- **Plumbing**: WTDP, Sinks, Faucets.
+- **Ventilation**: Vent box, Hood Liners, Power Packs.
+- **Optional Items**: Any item explicitly marked as "Optional" or "Alt" unless it is part of a valid room variant (e.g., "Opt Gourmet Kitchen").
+- **Left-Side Design Descriptions**: Ignore long paragraphs of design notes, architectural descriptions, or general notes on the left/side margins. Focus ONLY on the Floor Plan labels and Cabinet Schedules.
+- **Random Codes**: Do not extract random numbers, electrical symbols, or dimension lines.
+- **NON-KITCHEN/BATH AREAS (STRICT)**:
+  - **IGNORE ENTIRELY**: "Laundry", "Utility", "Mudroom", "Garage", "Pantry", "Living Room", "Dining Room".
+  - **EVEN IF THEY HAVE CABINETS**: Do NOT extract them. The user wants **ONLY KITCHENS AND BATHROOMS**.
+  - **Example**: If you see "OPT LAUNDRY" with "W3030", **IGNORE IT**.
+  - **Exception**: Only extract if the header explicitly says "KITCHEN" (e.g. "BUTLER'S PANTRY KITCHEN") or "BATH".
 
-### **CRITICAL INSTRUCTION FOR MISSING CODES**
-- **READ EVERY BOX**: Scan every rectangular cabinet box on the floor plan.
-- **LOOK FOR SMALL TEXT**: Codes like "W3042 BUTT" or "B15R" are often small. Zoom in conceptually.
-- **SUFFIXES ARE MANDATORY**: 
-    - "W3042 BUTT" is ONE item. Code="W3042 BUTT".
-    - "B15L" is different from "B15R".
-    - Capture "BUTT", "L", "R", "FH", "FE", "M", "P".
-- **HINGES & HARDWARE**: 
-    - If you see "Hinge", "Filler", "UF3", "DWR3", "TK", "Valance" - EXTRACT THEM.
-    - If there is a "Hardware Legend", process it fully.
+### **CRITICAL: COUNTING ACCURACY**
+- **COUNT EVERY INSTANCE**: If you see 4 identical cabinets in the drawing, you MUST extract 4.
+- **VISUAL VERIFICATION**: Look at the Floor Plan. If there are 4 boxes drawn for "B15" but the text label only appears once with "Qty: 4" ensure you extract quantity: 4.
+- **MISMATCH FIX**: If the text says "Qty: 3" but you see 4 drawn boxes, TRUST THE DRAWING (4 boxes).
+- **Cabinet 4 Issue**: Specifically check for cabinets that might be hidden in corners or islands. Don't miss the 4th cabinet!
 
-INTELLIGENCE RULES:
-1.  **Analyze All Input**: If text is provided, read it all. If images are provided, analyze every page.
-2.  **Room Detection (CRITICAL)**: 
-    - Look for the **Title Block** (bottom right/left) or **Room Label** (center of room).
-    - Use the FULL string found (e.g. "PLAN 4 KITCHEN OPTION 2").
-    - Assign the "room" field for EVERY item.
-3.  **Find Codes & Count Accurately (HYBRID MODE)**: 
-    - **TEXT PRIORITY**: If a "Cabinet Schedule" is provided in text, it is the SOURCE OF TRUTH for codes.
-    - **VISUAL PRIORITY**: Use Floor Plans to verify quantities and locations.
-    - **DEEP SCAN**: Scan walls clockwise. Don't miss islands or pantries.
-    - **EVERY LABEL MATTERS**: If "W3042" is written 4 times, count it 4 times.
-4.  **NKBA Categorization**:
-    - **Base**: B, SB, DB, LS, VSB, BEC, BBC.
-    - **Wall**: W, DC, WDC, WBC.
-    - **Tall**: T, U, O, P.
-    - **Appliance**: Fridge, Range, DW, Hood.
-    - **Hardware**: Hinge, Filler (UF), Toe Kick (TK), Skin, Panel, Molding, Valance, Corbel, Leg, Rod.
-    - **Finishing**: Touch-up, Stain, Paint.
-5.  **Infer Missing Codes**: If a cabinet has dimensions but no code (e.g., a 30" wide Base), construct the code "B30".
-6.  **Filter Noise**: Ignore electrical/plumbing symbols.
-7.  **Grouping**: 
-    - Hardware/Finishing specific to a room goes in that room.
-    - Loose/Bulk items go to "Finishing & Hardware".
+### **CRITICAL: INCLUSION & CATEGORIZATION RULES**
+✅ **EXTRACT & CATEGORIZE AS FOLLOWS**:
 
-Your extraction must be exhaustive and accurate.
+1. **Wall Cabinets** (Type: "Wall")
+   - Codes starting with: W, DC, WDC, WBC.
+
+2. **Base Cabinets** (Type: "Base")
+   - Codes starting with: B, SB, DB, LS, BEC, BBC.
+
+3. **Vanity Cabinets** (Type: "Vanity")
+   - Codes starting with: **VSB** (Vanity Single Bowl), VDB.
+   - **VSB** MUST be categorized as "Vanity", NOT "Base".
+
+4. **Tall Cabinets** (Type: "Tall")
+   - Codes starting with: T, U, O, P.
+   - **Universal Pillars** MUST be categorized as "Tall".
+
+5. **Fillers** (Type: "Filler")
+   - Codes starting with: F, UF, WF, TF.
+   - **Strictly separate** Fillers from Cabinets.
+
+6. **Hardware** (Type: "Hardware")
+   - **EXACT MATCH**: Extract hardware names/codes EXACTLY as written.
+   - Includes: Handles, Knobs, Hinges, Legs, Rods.
+
+7. **Finishing & Panels** (Type: "Finishing")
+   - Includes: Skin, Panel, Molding, Valance, Corbel, Toe Kick (TK), Touch-up kits.
+
+### **CRITICAL: ROOM GROUPING & MERGING**
+- **ONE ROOM, MULTIPLE PAGES**: A single room (like "Kitchen") often spans multiple pages (Floor Plan, Elevations A, B, C).
+- **MERGE THEM**: You MUST group all items from these related pages into **ONE single room entry**.
+- **REUSE EXACT NAMES**: If Page 1 says "STANDARD 42\" KITCHEN" and Page 2 says "STANDARD KITCHEN PLAN", output "STANDARD 42\" KITCHEN" for BOTH. Do not create variations.
+- **DO NOT** create separate rooms for "Kitchen Plan" and "Kitchen Elevation".
+- **DO NOT** create separate rooms for "Page 1" and "Page 2" if they are the same room.
+- **IDENTIFY THE HEADER**: Look for the **Specific Room Name** (e.g., "STANDARD 42\" KITCHEN" or "OPT GOURMET KITCHEN"). Use this EXACT name for ALL items in that section, regardless of the page view (Plan/Elevation).
+- **IGNORE**: "Elevation", "Plan View", "Detail", "Section" in room names.
+- **IGNORE**: "OPT LAUNDRY" headers if they are just notes on a page. Only extract if it is a DISTINCT room with a full layout. If it's just a text note "OPT LAUNDRY BASES...", ignore it as a room name.
+
+### **CRITICAL: TITLE BLOCK PARSING (AVOID SPLIT ERRORS)**
+- **WARNING**: Title blocks are often split across multiple lines.
+- **Example**:
+  Line 1: "MI HOMES SARASOTA 4031 MAGNOLIA"
+  Line 2: "STANDARD 42\" KITCHEN"
+  Line 3: "GARAGE RIGHT 1951"
+- **ACTION**: This is **ONE ROOM** called "STANDARD 42\" KITCHEN".
+  - "MI HOMES..." is Builder Info -> IGNORE.
+  - "GARAGE RIGHT..." is Location Info -> IGNORE.
+- **DO NOT** create a room called "GARAGE RIGHT".
+- **DO NOT** create a room called "STANDARD 42\" KITCHEN GARAGE RIGHT".
+- **ONLY** use the functional room name: "STANDARD 42\" KITCHEN".
+
+### **CRITICAL: ROOM SEQUENCE & NAMING**
+- **ORDER MATTERS**: You MUST process rooms in the **EXACT ORDER** they appear in the PDF pages.
+- **NO REORDERING**: Do not group all "Kitchens" together.
+- **TITLE BLOCK PRIORITY**: The Room Name is usually in the main Title Block (bottom/side of the page) or the largest text label.
+  - **Preferred**: "STANDARD 42\" KITCHEN", "OPT GOURMET KITCHEN", "STANDARD OWNERS BATH".
+  - **Avoid**: "Kitchen" (Too generic), "GARAGE RIGHT" (Not a room with cabinets), "MI HOMES" (Builder name).
+  - Use the **Full Architectural Name** found on the page.
+
+### **INTELLIGENCE RULES**:
+1.  **Analyze All Input**: Read every page provided.
+2.  **Room Detection**: Use Title Blocks or Room Labels. Assign the "room" field for EVERY item.
+3.  **Code Reading**:
+    - **TEXT PRIORITY**: Cabinet Schedules are the SOURCE OF TRUTH.
+    - **VISUAL PRIORITY**: Floor Plans verify quantities.
+    - **DEEP SCAN**: Scan walls clockwise.
+    - **Every Label Matters**: Count every instance of a code.
+4.  **Infer Missing Codes**: If a cabinet has dimensions but no code, construct one (e.g., "B30").
+
+Your extraction must be exhaustive, accurate, and strictly follow the exclusion rules.
 `;
+
+// Helper: Merge rooms that are likely the same (e.g. "Kitchen" vs "Kitchen Plan")
+function mergeSimilarRooms(items: CabinetItem[]): CabinetItem[] {
+    // 1. Map all items to their current room names
+    const roomMap = new Map<string, CabinetItem[]>();
+    items.forEach(item => {
+        const room = (item.room || "General").trim();
+        if (!roomMap.has(room)) roomMap.set(room, []);
+        roomMap.get(room)!.push(item);
+    });
+
+    const roomNames = Array.from(roomMap.keys());
+    const mergeMap = new Map<string, string>(); // oldName -> newName
+
+    // Helper to extract core identity of a room
+    const getRoomIdentity = (name: string) => {
+        const n = name.toUpperCase()
+            .replace(/PLAN|ELEVATION|VIEW|DETAIL|SECTION|PAGE|LEVEL|FLOOR|LAYOUT|SCHEMATIC|DRAWING/g, '') // Remove view types
+            .replace(/GARAGE\s*(RIGHT|LEFT)/g, '') // Remove location specific noise
+            .replace(/[^A-Z0-9\s]/g, ' ') // Remove special chars
+            .trim();
+        
+        const tokens = n.split(/\s+/).filter(t => t.length > 0);
+        
+        let type = "OTHER";
+        if (tokens.some(t => /KITCHEN/i.test(t))) type = "KITCHEN";
+        else if (tokens.some(t => /BATH|VANITY|ENSUITE|POWDER|RESTROOM/i.test(t))) type = "BATH";
+        else if (tokens.some(t => /LAUNDRY|UTILITY/i.test(t))) type = "LAUNDRY";
+
+        // Discriminators: Words that distinguish rooms of the same type
+        // We KEEP numbers like 1, 2, 3 (Bath 2 vs Bath 3)
+        // We KEEP adjectives like GOURMET, STANDARD, OWNERS, MASTER, GUEST
+        const discriminators = new Set<string>();
+        tokens.forEach(t => {
+            if (['KITCHEN', 'BATH', 'BATHROOM', 'VANITY', 'ROOM', 'PLAN', 'ELEVATION'].includes(t)) return;
+            // Ignore small numbers that might be part of dimensions (42) unless small (1, 2, 3)
+            if (/^\d+$/.test(t)) {
+                if (parseInt(t) < 10) discriminators.add(t); // Keep 1, 2, 3
+            } else {
+                discriminators.add(t);
+            }
+        });
+
+        return { type, discriminators, originalName: name, cleanName: n };
+    };
+
+    // 2. Identify merge candidates using fuzzy logic
+    for (let i = 0; i < roomNames.length; i++) {
+        for (let j = i + 1; j < roomNames.length; j++) {
+            const r1 = roomNames[i];
+            const r2 = roomNames[j];
+            
+            const id1 = getRoomIdentity(r1);
+            const id2 = getRoomIdentity(r2);
+
+            // Must be same type to merge (Kitchen != Bath)
+            if (id1.type !== id2.type) continue;
+            if (id1.type === 'OTHER') continue; // Don't merge unknown types aggressively
+
+            // Check discriminators
+            const d1 = Array.from(id1.discriminators);
+            const d2 = Array.from(id2.discriminators);
+            
+            const allDiscriminators = new Set([...d1, ...d2]);
+            const intersection = d1.filter(x => id2.discriminators.has(x));
+            
+            // CONFLICT CHECK:
+            // If both have DIFFERENT discriminators from the same category, DO NOT MERGE.
+            // e.g. "Standard" vs "Gourmet" -> Conflict
+            // e.g. "2" vs "3" -> Conflict
+            const conflicts = [
+                ['STANDARD', 'GOURMET'],
+                ['OWNERS', 'GUEST', 'HALL', 'POWDER'],
+                ['1', '2', '3', '4', '5'],
+                ['MASTER', 'GUEST', 'HALL']
+            ];
+
+            let hasConflict = false;
+            for (const group of conflicts) {
+                const present = group.filter(g => allDiscriminators.has(g));
+                if (present.length > 1) {
+                    // If we have both "Standard" and "Gourmet" across the two rooms, 
+                    // check if they are in the SAME room name (e.g. "Standard Gourmet"? Unlikely)
+                    // If r1 has Standard and r2 has Gourmet -> Conflict!
+                    const in1 = group.filter(g => id1.discriminators.has(g));
+                    const in2 = group.filter(g => id2.discriminators.has(g));
+                    if (in1.length > 0 && in2.length > 0 && in1[0] !== in2[0]) {
+                        hasConflict = true;
+                        break;
+                    }
+                }
+            }
+            if (hasConflict) continue;
+
+            // MERGE RULES:
+            // 1. If one is a subset of the other (e.g. "Kitchen" vs "Gourmet Kitchen") -> Merge into the more specific one
+            // 2. If they share a strong discriminator (e.g. both have "Owners") -> Merge
+            // 3. If one has NO discriminators (Generic "Kitchen") -> Merge into specific ("Standard Kitchen")
+
+            const isSubset1 = d1.every(x => id2.discriminators.has(x)); // r1 is subset of r2
+            const isSubset2 = d2.every(x => id1.discriminators.has(x)); // r2 is subset of r1
+            
+            if (isSubset1 || isSubset2) {
+                // Merge!
+                // Prefer the name with MORE discriminators (more specific)
+                const target = d2.length > d1.length ? r2 : r1;
+                const source = target === r1 ? r2 : r1;
+                mergeMap.set(source, target);
+            }
+        }
+    }
+
+    // 3. Apply merges
+    // Recursive lookup to handle chains (A->B, B->C => A->C)
+    const getFinalName = (name: string): string => {
+        let current = name;
+        const visited = new Set<string>();
+        while (mergeMap.has(current)) {
+            if (visited.has(current)) break; // Circular protection
+            visited.add(current);
+            current = mergeMap.get(current)!;
+        }
+        return current;
+    };
+
+    items.forEach(item => {
+        item.room = getFinalName((item.room || "General").trim());
+    });
+
+    return items;
+}
 
 // Helper: Consolidate identical items to prevent duplicates from multiple views
 function consolidateItems(items: any[]): any[] {
+    // First, merge rooms to ensure we are comparing items within the same logical room
+    items = mergeSimilarRooms(items);
+
     const map = new Map<string, any>();
 
     items.forEach(item => {
@@ -88,6 +298,14 @@ function consolidateItems(items: any[]): any[] {
         if (map.has(key)) {
             const existing = map.get(key);
             existing.quantity += (item.quantity || 1); // Fix: use item.quantity not item.qty (mapped items use quantity)
+            
+            // Keep the earliest sourcePage
+            if (item.sourcePage && item.sourcePage > 0) {
+                if (!existing.sourcePage || existing.sourcePage === 0 || item.sourcePage < existing.sourcePage) {
+                    existing.sourcePage = item.sourcePage;
+                }
+            }
+
             // Merge notes if different
             if (item.notes && !existing.notes.includes(item.notes)) {
                 existing.notes += "; " + item.notes;
@@ -280,10 +498,11 @@ function extractFromChunk(chunk: string, items: CabinetItem[], pageNum: string, 
     let isHardwareSection = false;
     
     // --- IMPROVED HEADER DETECTION (Regex) ---
-    // Relaxed regex to capture full architectural room names
-    // Matches lines containing room types, allowing for prefixes/suffixes
-    // Added 'unit', 'plan', 'elevation', 'opt' to help capture context lines like "UNIT 204 KITCHEN OPT 2"
-    const roomTypeKeywords = /kitchen|bath|bathroom|vanity|ensuite|powder|restroom|owners|master|laundry|utility|mud|pantry|living|dining|bed|closet|wic|unit|plan|opt|type/i;
+    // Matches lines containing room types
+    // Removed 'unit', 'plan', 'elevation', 'opt', 'type', 'garage', 'laundry', 'utility', 'mud', 'pantry' to prevent false positive rooms
+    // We want to detect the MAIN ROOM NAME (e.g. "STANDARD 42 KITCHEN") not "Kitchen Plan" or "Garage Right"
+    // STRICT MODE: Only KITCHEN and BATH/VANITY keywords allowed as per user request to avoid "extra rooms" like Living/Dining/Bed/Closet
+    const roomTypeKeywords = /kitchen|bath|bathroom|vanity|ensuite|powder|restroom|owners|master/i;
 
     for (const line of lines) {
         if (line.length < 4) continue;
@@ -291,7 +510,15 @@ function extractFromChunk(chunk: string, items: CabinetItem[], pageNum: string, 
         
         const lower = line.toLowerCase();
         let potentialHeader = line.trim();
-        let isSameLineHeader = false;
+
+        // 1. Explicitly IGNORE "Garage" unless it's a "Garage Cabinet" list (unlikely for now based on user feedback)
+        if (lower.includes('garage') && !lower.includes('cabinet')) continue;
+        
+        // 2. IGNORE "Plan", "Elevation", "Detail", "Section" as room headers
+        // These are usually view labels, not distinct room names
+        if (lower.includes('plan') || lower.includes('elevation') || lower.includes('detail') || lower.includes('section')) {
+            continue;
+        }
         
         // Check for specific Hardware/Finishing headers
         if (lower.includes('hardware') || lower.includes('accessories') || lower.includes('finishing') || lower.includes('miscellaneous')) {
@@ -300,6 +527,24 @@ function extractFromChunk(chunk: string, items: CabinetItem[], pageNum: string, 
                  context.currentRoom = "Hardware & Finishing";
                  continue;
              }
+        }
+
+        // --- IGNORED ROOM DETECTION ---
+        // Explicitly catch Laundry, Utility, Garage headers to stop extraction until a valid room is found
+        if (/laundry|utility|mudroom|pantry|garage|living|dining|closet|bedroom/i.test(line)) {
+            // Only ignore if it does NOT contain Kitchen/Bath keywords
+            if (!/kitchen|bath|vanity|ensuite|powder/i.test(line)) {
+                // Check if it looks like a header (short, not a sentence, no codes)
+                const isInstruction = /install|refer|note|see|drawing|scale|detail|section/i.test(line); 
+                const isCode = /^[A-Z]{1,3}\d/.test(line); 
+                
+                if (!isInstruction && !isCode && potentialHeader.length < 50) {
+                     console.log(`Local Regex: Entering Ignored Zone: "${potentialHeader}"`);
+                     context.currentRoom = "IGNORE_ZONE";
+                     isHardwareSection = false;
+                     continue;
+                }
+            }
         }
 
         // --- ROOM HEADER DETECTION ---
@@ -353,6 +598,9 @@ function extractFromChunk(chunk: string, items: CabinetItem[], pageNum: string, 
         if (qtyMatch) qty = parseInt(qtyMatch[1], 10);
         
         for (const match of matches) {
+            // SKIP items in Ignored Zones
+            if (context.currentRoom === "IGNORE_ZONE") continue;
+
             // Match[1] is standard code, Match[2] is hardware keyword
             const code = match[1] || match[2]; 
             if (!code) continue;
@@ -373,7 +621,7 @@ function extractFromChunk(chunk: string, items: CabinetItem[], pageNum: string, 
                 originalCode: code,
                 quantity: qty,
                 type: type,
-                description: 'Local Extract', 
+                description: generateDescriptionFromCode(code, type), 
                 width: 0, height: 0, depth: 0,
                 room: context.currentRoom,
                 sourcePage: parseInt(pageNum) || 0
@@ -608,11 +856,7 @@ export async function extractManufacturerSpecs(file: File): Promise<any> {
     };
 
     try {
-        const result = await ai.models.generateContent({
-            model: MODEL_NAME,
-            contents: { parts: contentsParts },
-            config: generationConfig
-        });
+        const result = await generateWithFallback(ai, { parts: contentsParts }, generationConfig);
 
         let text = "";
         const r = result as any;
@@ -961,7 +1205,7 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
         // Check if token limit is sufficient for 19 pages output
     const generationConfig = {
         temperature: 0.2, // Low temperature for factual extraction
-        maxOutputTokens: 65536, // Maximize for multi-page output (Gemini 2.5 Flash supports huge context)
+        maxOutputTokens: 8192, // Standard max for Flash models (sufficient for JSON output)
         responseMimeType: "application/json",
         responseSchema: {
             type: "OBJECT",
@@ -992,6 +1236,7 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
                                 height: { type: "NUMBER" },
                                 depth: { type: "NUMBER" },
                                 extractedPrice: { type: "NUMBER" },
+                                sourcePage: { type: "NUMBER", description: "The Page Number where this item was found." },
                                 modifications: {
                                     type: "ARRAY",
                                     items: {
@@ -1013,11 +1258,7 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
         };
 
         const response = await callAIWithRetry(async () => {
-            const result = await ai.models.generateContent({
-                model: MODEL_NAME,
-                contents: { parts: contentsParts },
-                config: generationConfig
-            });
+            const result = await generateWithFallback(ai, { parts: contentsParts }, generationConfig);
             return result;
         });
 
@@ -1192,6 +1433,7 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
                 depth: depth,
                 quantity: typeof item.qty === 'number' ? item.qty : 1,
                 room: item.room || "General",
+                sourcePage: typeof item.sourcePage === 'number' ? item.sourcePage : 0,
                 notes: item.notes || "",
                 extractedPrice: item.extractedPrice || undefined,
                 modifications: Array.isArray(item.modifications) ? item.modifications : []
@@ -1288,13 +1530,9 @@ export async function determineExcelStructure(sheetName: string, sampleRows: any
 
     try {
         const response = await callAIWithRetry(async () => {
-            return await ai.models.generateContent({
-                model: MODEL_NAME, // Use the default Flash model
-                contents: { parts: [{ text: prompt }, { text: dataStr }] },
-                config: { 
-                    responseMimeType: "application/json",
-                    temperature: 0.0 // Deterministic
-                }
+            return await generateWithFallback(ai, { parts: [{ text: prompt }, { text: dataStr }] }, { 
+                responseMimeType: "application/json",
+                temperature: 0.0 // Deterministic
             });
         });
         
@@ -1309,4 +1547,64 @@ export async function determineExcelStructure(sheetName: string, sampleRows: any
         console.error("Structure Analysis Failed", e);
         return { skuColumn: null, priceColumns: [], optionTableType: null, doorStyleName: null };
     }
+}
+
+// Helper to generate descriptive text from code when AI fails or Local Extract is used
+function generateDescriptionFromCode(code: string, type: CabinetType): string {
+    const c = code.toUpperCase();
+    
+    // Fillers
+    if (c.startsWith('UF')) return `Universal Filler ${c.replace('UF', '')}`;
+    if (c.startsWith('F') && !isNaN(parseInt(c[1]))) return `Filler ${c.replace('F', '')}`;
+    if (c.startsWith('WF')) return `Wall Filler ${c.replace('WF', '')}`;
+    if (c.startsWith('TF')) return `Tall Filler ${c.replace('TF', '')}`;
+    
+    // Wall
+    if (type === 'Wall') {
+        if (c.startsWith('W')) {
+            // W3042 -> Wall Cabinet 30" W x 42" H
+            // W304224 -> Wall Cabinet 30" W x 42" H x 24" D
+            const nums = c.match(/\d+/);
+            if (nums) {
+                const n = nums[0];
+                if (n.length === 4) return `Wall Cabinet ${n.substring(0,2)}" W x ${n.substring(2)}" H`;
+                if (n.length === 6) return `Wall Cabinet ${n.substring(0,2)}" W x ${n.substring(2,4)}" H x ${n.substring(4)}" D`;
+            }
+            return "Wall Cabinet";
+        }
+        if (c.startsWith('DC') || c.startsWith('WDC')) return "Diagonal Corner Wall Cabinet";
+        if (c.startsWith('WBC')) return "Blind Corner Wall Cabinet";
+    }
+
+    // Base
+    if (type === 'Base') {
+        if (c.startsWith('B')) {
+            const nums = c.match(/\d+/);
+            if (nums) return `Base Cabinet ${nums[0]}"`;
+            return "Base Cabinet";
+        }
+        if (c.startsWith('SB')) return `Sink Base ${c.replace('SB', '')}"`;
+        if (c.startsWith('DB')) return `Drawer Base ${c.replace('DB', '')}"`;
+        if (c.startsWith('LS')) return "Lazy Susan Base";
+        if (c.startsWith('BEC')) return "Base End Cabinet";
+        if (c.startsWith('BBC')) return "Blind Base Corner";
+    }
+
+    // Tall
+    if (type === 'Tall') {
+        if (c.startsWith('T') || c.startsWith('U')) {
+             const nums = c.match(/\d+/);
+             if (nums && nums[0].length >= 4) return `Tall Cabinet ${nums[0].substring(0,2)}" W x ${nums[0].substring(2)}" H`;
+             return "Tall Utility Cabinet";
+        }
+        if (c.startsWith('O')) return "Oven Cabinet";
+    }
+
+    // Vanity
+    if (type === 'Vanity') {
+        if (c.startsWith('VSB')) return `Vanity Sink Base ${c.replace('VSB', '')}"`;
+        if (c.startsWith('VDB')) return `Vanity Drawer Base ${c.replace('VDB', '')}"`;
+    }
+
+    return "Extracted Item";
 }

@@ -100,15 +100,15 @@ export async function convertPdfToImages(file: File, pagesToRender?: number[]): 
                     const page = await pdf.getPage(pageNum);
                     
                     // Scale logic: Balanced quality for AI
-                    // Target max dimension ~1400px to ensure legibility while maximizing speed.
-                    // 1600px was good, but 1400px is faster and sufficient for "BUTT" suffixes.
-                    let scale = 3.0; 
+                    // Target max dimension ~1024px to ensure speed while maintaining legibility.
+                    // Reduced from 1400px to 1024px for sub-30s performance requirement.
+                    let scale = 2.0; 
                     const unscaledViewport = page.getViewport({ scale: 1.0 });
                     const maxDim = Math.max(unscaledViewport.width, unscaledViewport.height);
                     
-                    // Limit to 1400px
-                    if (maxDim * scale > 1400) {
-                        scale = 1400 / maxDim;
+                    // Limit to 1024px (Standard HD is enough for Cabinet Codes like B30)
+                    if (maxDim * scale > 1024) {
+                        scale = 1024 / maxDim;
                     }
                     
                     const viewport = page.getViewport({ scale });
@@ -126,9 +126,9 @@ export async function convertPdfToImages(file: File, pagesToRender?: number[]): 
                         viewport: viewport
                     } as any).promise;
 
-                    // Convert to JPEG with quality 0.6 (Good Web Quality)
-                    // Reduced from 0.7 to 0.6 to speed up processing and reduce payload size
-                    const dataUrl = canvas.toDataURL('image/jpeg', 0.6);
+                    // Convert to JPEG with quality 0.5 (Fast Web Quality)
+                    // Reduced from 0.6 to 0.5 to speed up processing and reduce payload size
+                    const dataUrl = canvas.toDataURL('image/jpeg', 0.5);
                     
                     // Strip prefix
                     const cleanData = dataUrl.split(',')[1];

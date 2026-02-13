@@ -475,49 +475,53 @@ export const calculateProjectPricing = (
   manufacturer: Manufacturer,
   tierId: string, 
   specs?: ProjectSpecs,
-  financials?: any // Using any temporarily to avoid circular deps if types aren't fully propagated, but practically it's ProjectFinancials
+  financials?: any, // Using any temporarily to avoid circular deps if types aren't fully propagated, but practically it's ProjectFinancials
+  roomSpecs?: Record<string, ProjectSpecs> // NEW: Room Specific Specs
 ): PricingLineItem[] => {
-  const tier = manufacturer.tiers.find(t => t.id === tierId) || manufacturer.tiers[0];
-  const tierNameForLookup = tier ? tier.name : (specs?.priceGroup || 'Standard');
+  const globalTier = manufacturer.tiers.find(t => t.id === tierId) || manufacturer.tiers[0];
+  const globalTierName = globalTier ? globalTier.name : (specs?.priceGroup || 'Standard');
   
-  // 1. Get Checkbox Options
-  const checkboxOptions = manufacturer.options?.filter(opt => !!specs?.selectedOptions?.[opt.id]) || [];
+  // Pre-calculate Global Options
+  const getOptionsForSpecs = (s?: ProjectSpecs) => {
+      const checkboxOptions = manufacturer.options?.filter(opt => !!s?.selectedOptions?.[opt.id]) || [];
+      const potentialOptionNames = [
+          s?.drawerBox, s?.hingeType, s?.woodSpecies, s?.finishColor, s?.glaze,
+          s?.finishOption1, s?.finishOption2, s?.printedEndOption,
+          s?.wallDoorOption, s?.baseDoorOption,
+          ...Object.values(s?.dynamicSelections || {})
+      ].filter(val => val && val !== 'None' && val !== 'Standard' && val !== 'No'); 
+      
+      const dropdownOptions = manufacturer.options?.filter(opt => 
+          potentialOptionNames.some(name => name && name.toLowerCase() === opt.name.toLowerCase())
+      ) || [];
+      
+      return [...checkboxOptions, ...dropdownOptions.filter(d => !checkboxOptions.find(c => c.id === d.id))];
+  };
 
-  // 2. Get Dropdown Options (Match by Name)
-  const potentialOptionNames = [
-      specs?.drawerBox,
-      specs?.hingeType, 
-      specs?.woodSpecies,
-      specs?.finishColor,
-      specs?.glaze,
-      specs?.finishOption1,
-      specs?.finishOption2,
-      specs?.printedEndOption,
-      specs?.wallDoorOption,
-      specs?.baseDoorOption,
-      ...Object.values(specs?.dynamicSelections || {})
-  ].filter(val => val && val !== 'None' && val !== 'Standard' && val !== 'No'); 
-
-  const dropdownOptions = manufacturer.options?.filter(opt => 
-      potentialOptionNames.some(name => {
-          if (!name) return false;
-          if (name.toLowerCase() === opt.name.toLowerCase()) return true;
-          return false;
-      })
-  ) || [];
-
-  const activeOptions = [...checkboxOptions];
-  dropdownOptions.forEach(opt => {
-      if (!activeOptions.find(o => o.id === opt.id || o.name === opt.name)) {
-          activeOptions.push(opt);
-      }
-  });
+  const globalOptions = getOptionsForSpecs(specs);
 
   const results: PricingLineItem[] = [];
 
   items.forEach(item => {
     // 0. Garbage Check
     if (isGarbageItem(item)) return;
+
+    // --- DETERMINE ROOM CONTEXT ---
+    let effectiveSpecs = specs;
+    let effectiveTierName = globalTierName;
+    let activeOptions = globalOptions;
+
+    // Check for Room Override
+    if (item.room && roomSpecs && roomSpecs[item.room]) {
+        effectiveSpecs = { ...specs, ...roomSpecs[item.room] }; // Merge global with room (room wins)
+        // Recalculate options for this room
+        activeOptions = getOptionsForSpecs(effectiveSpecs);
+        
+        // Determine Tier for this room (Price Group)
+        if (effectiveSpecs.priceGroup) {
+            effectiveTierName = effectiveSpecs.priceGroup;
+        }
+    }
 
     let basePrice = 0;
     let source = 'Unknown';
@@ -559,12 +563,12 @@ export const calculateProjectPricing = (
     const { exact, similar } = generateSmartKeys(item);
     
     // Pass 1: Try exact/fuzzy match on ORIGINAL code
-    match = findCatalogPrice(item.originalCode, manufacturer.catalog || {}, tierNameForLookup, true);
+    match = findCatalogPrice(item.originalCode, manufacturer.catalog || {}, effectiveTierName, true);
 
     // Pass 2: Try EXACT keys STRICTLY
     if (!match) {
         for (const key of exact) {
-            match = findCatalogPrice(key, manufacturer.catalog || {}, tierNameForLookup, true);
+            match = findCatalogPrice(key, manufacturer.catalog || {}, effectiveTierName, true);
             if (match) {
                 match.source = `Catalog (Exact Match '${key}')`;
                 break;
@@ -575,7 +579,7 @@ export const calculateProjectPricing = (
     // Pass 3: Try SIMILAR keys STRICTLY
     if (!match) {
         for (const key of similar) {
-            match = findCatalogPrice(key, manufacturer.catalog || {}, tierNameForLookup, true);
+            match = findCatalogPrice(key, manufacturer.catalog || {}, effectiveTierName, true);
             if (match) {
                 match.source = `Catalog (Similar Match '${key}')`;
                 break;
@@ -585,7 +589,7 @@ export const calculateProjectPricing = (
     
     // Pass 4: Fallback to Fuzzy/Loose matching on Original Code
     if (!match) {
-        match = findCatalogPrice(item.originalCode, manufacturer.catalog || {}, tierNameForLookup, false);
+        match = findCatalogPrice(item.originalCode, manufacturer.catalog || {}, effectiveTierName, false);
     }
 
     // Pass 5: GLOBAL CATALOG SEARCH (The "Full XLSM" Fallback)
@@ -603,7 +607,7 @@ export const calculateProjectPricing = (
             });
             
             if (potentialMatch) {
-                match = getPriceFromItem(manufacturer.catalog![potentialMatch], tierNameForLookup, potentialMatch, `Catalog (Global Prefix Match '${potentialMatch}')`);
+                match = getPriceFromItem(manufacturer.catalog![potentialMatch], effectiveTierName, potentialMatch, `Catalog (Global Prefix Match '${potentialMatch}')`);
             }
         }
     }
@@ -654,7 +658,7 @@ export const calculateProjectPricing = (
     let margin = financials?.globalMargin || 0;
     if (financials?.categoryMargins) {
          // Try to match by Tier Name or Door Style
-         const tierName = tier ? tier.name : 'Standard';
+         const tierName = effectiveTierName || 'Standard';
          if (financials.categoryMargins[tierName]) {
              margin = financials.categoryMargins[tierName];
          }
@@ -688,7 +692,7 @@ export const calculateProjectPricing = (
       pricingFactor: roomFactor,
       margin: marginDecimal * 100,
       
-      tierName: tier ? tier.name : 'Standard',
+      tierName: effectiveTierName || 'Standard',
       source,
       appliedOptions: appliedOptionsLog
     });

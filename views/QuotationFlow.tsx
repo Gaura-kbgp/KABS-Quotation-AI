@@ -166,7 +166,12 @@ export const QuotationFlow: React.FC = () => {
     await storage.saveActiveProject(updated);
   };
 
-  const recalculateAllPricing = async (currentFinancials: ProjectFinancials, currentItems: CabinetItem[]) => {
+  const recalculateAllPricing = async (
+      currentFinancials: ProjectFinancials, 
+      currentItems: CabinetItem[],
+      newSpecs?: ProjectSpecs,
+      newRoomSpecs?: Record<string, ProjectSpecs>
+  ) => {
       if (!project || !project.manufacturerId) return;
       
       const mfg = manufacturers.find(m => m.id === project.manufacturerId);
@@ -182,12 +187,14 @@ export const QuotationFlow: React.FC = () => {
       }
 
       const tierId = project.selectedTierId || 'default';
+      const effectiveSpecs = newSpecs || project.specs;
+      const effectiveRoomSpecs = newRoomSpecs || project.roomSpecs;
       
       // We need to re-run the pricing engine for ALL items
       // This ensures Factor and Margin changes propagate
-      const newPricing = calculateProjectPricing(currentItems, mfg, tierId, project.specs, currentFinancials);
+      const newPricing = calculateProjectPricing(currentItems, mfg, tierId, effectiveSpecs, currentFinancials, effectiveRoomSpecs);
       
-      updateProject({ pricing: newPricing, financials: currentFinancials });
+      updateProject({ pricing: newPricing, financials: currentFinancials, specs: effectiveSpecs, roomSpecs: effectiveRoomSpecs });
   };
 
   const updateFinancials = async (field: keyof ProjectFinancials, value: number) => {
@@ -364,8 +371,7 @@ export const QuotationFlow: React.FC = () => {
         roomGroups[room].push(item);
     });
     
-    // Flatten logic: Return { room, items: [...] } sorted by type/name
-    // Remove .sort() on keys to preserve PDF order (mostly)
+    // Flatten logic: Return { room, items: [...] } sorted by source page (PDF Order)
     return Object.keys(roomGroups).map(room => {
         const roomItems = roomGroups[room].sort((a, b) => {
              // Force Manual Entries to bottom
@@ -382,16 +388,21 @@ export const QuotationFlow: React.FC = () => {
              return (a.originalCode || '').localeCompare(b.originalCode || '');
         });
 
-        // We wrap it in a single "category" called "All Items" to maintain compatibility with the rendering loop
-        // or we refactor the rendering loop. 
-        // Let's change the return type to flat items and update the rendering loop.
+        // Determine the "start page" for this room (min sourcePage)
+        const minPage = Math.min(...roomItems.map(i => i.sourcePage || 9999));
+
         return { 
             room, 
             items: roomItems,
-            totalQty: roomItems.reduce((sum, i) => sum + i.quantity, 0)
+            totalQty: roomItems.reduce((sum, i) => sum + i.quantity, 0),
+            minPage: minPage // Add minPage for sorting
         };
     }).sort((a, b) => {
-        // Custom Room Sorting: Kitchens first, then Baths, then others, Hardware/Finishing last
+        // PDF Page Order Priority
+        // If rooms start on different pages, use that order
+        if (a.minPage !== b.minPage) return a.minPage - b.minPage;
+
+        // If on same page, use kitchen priority
         const typeA = getRoomTypeScore(a.room);
         const typeB = getRoomTypeScore(b.room);
         
@@ -787,6 +798,9 @@ export const QuotationFlow: React.FC = () => {
                  if (item.isManual || item.originalCode === 'NEW ITEM' || item.description === 'Manual Entry') {
                      cat = 'Manual / Added Items';
                  }
+                 else if (cat === 'Vanity') {
+                     cat = 'Vanity Cabinets';
+                 }
                  else if (cat === 'Base') {
                      cat = (roomLower.includes('bath') || roomLower.includes('vanity') || roomLower.includes('ensuite') || roomLower.includes('powder')) 
                          ? 'Vanity Cabinets' 
@@ -795,7 +809,8 @@ export const QuotationFlow: React.FC = () => {
                  else if (cat === 'Wall') cat = 'Wall Cabinets';
                  else if (cat === 'Tall') cat = 'Tall Cabinets';
                  else if (cat === 'Hardware') cat = 'Hinges & Hardware';
-                 else if (cat === 'Finishing' || cat === 'Panel' || cat === 'Filler') cat = 'Finishing, Panels & Fillers';
+                 else if (cat === 'Filler') cat = 'Fillers';
+                 else if (cat === 'Finishing' || cat === 'Panel') cat = 'Finishing & Panels';
                  else if (cat === 'Appliance') cat = 'Appliances';
                  else if (cat === 'Accessory') cat = 'Accessories';
                  else if (cat === 'Modification') cat = 'Modifications';
@@ -807,7 +822,7 @@ export const QuotationFlow: React.FC = () => {
 
             const displayOrder = [
                 'Wall Cabinets', 'Base Cabinets', 'Vanity Cabinets', 'Tall Cabinets', 
-                'Appliances', 'Hinges & Hardware', 'Finishing, Panels & Fillers', 
+                'Appliances', 'Hinges & Hardware', 'Fillers', 'Finishing & Panels', 
                 'Accessories', 'Modifications', 'Other Items', 'Manual / Added Items'
             ];
 
@@ -1064,7 +1079,7 @@ export const QuotationFlow: React.FC = () => {
         // Wait a tick to ensure UI updates
         await new Promise(r => setTimeout(r, 100));
 
-        setLoadingMessage("AI Vision Analyzing Plan (Fast Deep Scan: 15-30s)...");
+        setLoadingMessage("AI Vision Analyzing Plan (Fast Deep Scan: 10-20s)...");
         const result = await analyzePlan(file, nkbaRules?.data);
         
         if (result.items.length === 0) {
@@ -1154,7 +1169,7 @@ export const QuotationFlow: React.FC = () => {
              mfg.tiers = [{ id: 'default', name: 'Standard', multiplier: 1.0 }];
          }
          if (tierIdToUse) {
-             const pricing = calculateProjectPricing(project.items, mfg, tierIdToUse, project.specs, financials);
+             const pricing = calculateProjectPricing(project.items, mfg, tierIdToUse, project.specs, financials, project.roomSpecs);
              await updateProject({ pricing, selectedTierId: tierIdToUse });
              setIsLoading(false);
              setLoadingMessage("");
@@ -1166,7 +1181,7 @@ export const QuotationFlow: React.FC = () => {
   const updateSpec = (field: keyof ProjectSpecs, value: string) => {
      if (!project) return;
      const newSpecs = { ...project.specs, [field]: value };
-     updateProject({ specs: newSpecs });
+     recalculateAllPricing(financials, project.items, newSpecs);
   };
 
   const updateDynamicSelection = (category: string, value: string) => {
@@ -1179,11 +1194,15 @@ export const QuotationFlow: React.FC = () => {
 
       if (category === 'Collection') {
           updates.seriesName = value; 
+          updates.priceGroup = value; // Sync Price Group (Tier) with Collection
           // Reset dependent Door Style when Collection changes
           newDyn['DoorStyle'] = ''; 
           updates.wallDoorStyle = '';
       }
-      if (category === 'Series') updates.seriesName = value;
+      if (category === 'Series') {
+          updates.seriesName = value;
+          updates.priceGroup = value;
+      }
       if (category === 'DoorStyle') updates.wallDoorStyle = value;
       if (category === 'Finish' || category === 'Paint' || category === 'Stain') updates.finishColor = value;
       if (category === 'Hinge') updates.hingeType = value;
@@ -1191,13 +1210,45 @@ export const QuotationFlow: React.FC = () => {
 
       updates.dynamicSelections = newDyn;
       const newSpecs = { ...project.specs, ...updates };
-      updateProject({ specs: newSpecs });
+      recalculateAllPricing(financials, project.items, newSpecs);
+  };
+
+  const updateRoomDynamicSelection = (roomName: string, category: string, value: string) => {
+      if (!project) return;
+      const currentRoomSpecs = project.roomSpecs || {};
+      const roomSpec = currentRoomSpecs[roomName] || {};
+      const currentDyn = roomSpec.dynamicSelections || {};
+
+      // Logic mirrors updateDynamicSelection but for a specific room
+      const updates: Partial<ProjectSpecs> = {};
+      const newDyn = { ...currentDyn, [category]: value };
+
+      if (category === 'Collection') {
+          updates.seriesName = value; 
+          updates.priceGroup = value; // IMPORTANT: Room Price Group Override
+          newDyn['DoorStyle'] = ''; 
+          updates.wallDoorStyle = '';
+      }
+      if (category === 'Series') {
+          updates.seriesName = value;
+          updates.priceGroup = value;
+      }
+      if (category === 'DoorStyle') updates.wallDoorStyle = value;
+      if (category === 'Finish' || category === 'Paint' || category === 'Stain') updates.finishColor = value;
+
+      updates.dynamicSelections = newDyn;
+      
+      const newRoomSpec = { ...roomSpec, ...updates };
+      const newRoomSpecs = { ...currentRoomSpecs, [roomName]: newRoomSpec };
+      
+      recalculateAllPricing(financials, project.items, undefined, newRoomSpecs);
   };
 
   const toggleOption = (optionId: string, checked: boolean) => {
       if (!project || !project.specs) return;
       const newSelected = { ...project.specs.selectedOptions, [optionId]: checked };
-      updateProject({ specs: { ...project.specs, selectedOptions: newSelected } });
+      const newSpecs = { ...project.specs, selectedOptions: newSelected };
+      recalculateAllPricing(financials, project.items, newSpecs);
   };
 
 
@@ -1421,7 +1472,8 @@ export const QuotationFlow: React.FC = () => {
                         else if (cat === 'Wall') cat = 'Wall Cabinets';
                         else if (cat === 'Tall') cat = 'Tall Cabinets';
                         else if (cat === 'Hardware') cat = 'Hinges & Hardware';
-                        else if (cat === 'Finishing' || cat === 'Panel' || cat === 'Filler') cat = 'Finishing, Panels & Fillers';
+                        else if (cat === 'Filler') cat = 'Fillers';
+                        else if (cat === 'Finishing' || cat === 'Panel') cat = 'Finishing & Panels';
                         else if (cat === 'Appliance') cat = 'Appliances';
                         else if (cat === 'Accessory') cat = 'Accessories';
                         else if (cat === 'Modification') cat = 'Modifications';
@@ -1439,7 +1491,8 @@ export const QuotationFlow: React.FC = () => {
                        'Tall Cabinets', 
                        'Appliances', 
                        'Hinges & Hardware', 
-                       'Finishing, Panels & Fillers', 
+                       'Fillers',
+                       'Finishing & Panels', 
                        'Accessories', 
                        'Modifications',
                        'Other Items',
@@ -1678,6 +1731,8 @@ export const QuotationFlow: React.FC = () => {
                             </div>
                         </div>
 
+
+
                         {/* Secondary Finishes: Wood, Finish, Glaze, etc. */}
                         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6 pt-4 border-t border-slate-100">
                              {['Wood', 'Finish', 'Paint', 'Stain', 'Glaze'].map(cat => {
@@ -1707,6 +1762,90 @@ export const QuotationFlow: React.FC = () => {
                         </div>
                     </div>
                 </div>
+
+                {/* --- ROOM-WISE SPECIFICATIONS --- */}
+                {(() => {
+                    const rooms = Array.from(new Set(project.items.map(i => i.room || "General")));
+                    if (rooms.length > 0) {
+                        return (
+                             <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden mt-8 animate-in slide-in-from-bottom-4 duration-500 delay-100">
+                                <div className="bg-slate-50/80 px-8 py-4 border-b border-slate-200 flex items-center justify-between">
+                                    <h3 className="text-lg font-bold text-slate-800 flex items-center gap-2">
+                                        <Layers className="w-5 h-5 text-brand-600"/> Room-Specific Overrides
+                                    </h3>
+                                    <div className="text-xs font-medium text-slate-500 bg-white border border-slate-200 px-2 py-1 rounded">Optional</div>
+                                </div>
+                                <div className="p-8 space-y-6 bg-slate-50/30">
+                                    <p className="text-sm text-slate-500 mb-2">
+                                        Use this section to override the global Collection or Door Style for specific rooms (e.g., if the Kitchen is "Elite" but the Laundry is "Standard").
+                                    </p>
+                                    {rooms.map(roomName => {
+                                        const roomSpec = project.roomSpecs?.[roomName] || {};
+                                        const roomDyn = roomSpec.dynamicSelections || {};
+                                        
+                                        // Determine effective collection for this room (Local Override > Global)
+                                        const effectiveCollection = roomDyn['Collection'] || project.specs?.dynamicSelections?.['Collection'];
+
+                                        return (
+                                            <div key={roomName} className="bg-white border border-slate-200 rounded-lg shadow-sm overflow-hidden p-6 hover:shadow-md transition-shadow">
+                                                <div className="flex items-center gap-3 mb-4 pb-2 border-b border-slate-100">
+                                                    <div className="w-8 h-8 rounded-full bg-brand-50 flex items-center justify-center text-brand-600 font-bold text-xs">
+                                                        {roomName.substring(0, 2).toUpperCase()}
+                                                    </div>
+                                                    <h4 className="font-bold text-slate-800">{roomName}</h4>
+                                                </div>
+                                                
+                                                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                                    {/* Room Collection */}
+                                                    <div className="space-y-1">
+                                                        <label className="text-xs font-bold text-slate-500 uppercase">Collection</label>
+                                                        <SpecField 
+                                                            label="Collection"
+                                                            type="select" 
+                                                            options={[
+                                                                { id: 'default', label: 'Use Project Default', value: '' },
+                                                                ...(groupedOptions['Collection'] || []).map((o, i) => ({ id: `r_coll_${i}`, label: o.name, value: o.name }))
+                                                            ]}
+                                                            value={roomDyn['Collection'] || ''} 
+                                                            onChange={(v: string) => updateRoomDynamicSelection(roomName, 'Collection', v)} 
+                                                        />
+                                                    </div>
+
+                                                    {/* Room Door Style */}
+                                                    <div className="space-y-1">
+                                                        <label className="text-xs font-bold text-slate-500 uppercase">Door Style</label>
+                                                        {(() => {
+                                                            let options = groupedOptions['DoorStyle'] || [];
+                                                            // Filter based on EFFECTIVE collection for this room
+                                                            if (effectiveCollection) {
+                                                                options = options.filter(o => (o as any).parentCollection === effectiveCollection);
+                                                            } else if (groupedOptions['Collection'] && groupedOptions['Collection'].length > 0) {
+                                                                options = [];
+                                                            }
+                                                            
+                                                            return (
+                                                                <SpecField 
+                                                                    label="Door Style"
+                                                                    type="select" 
+                                                                    options={[
+                                                                        { id: 'default', label: 'Use Project Default', value: '' },
+                                                                        ...Array.from(new Set(options.map(o => o.name))).map((name, i) => ({ id: `r_door_${i}`, label: name, value: name }))
+                                                                    ]}
+                                                                    value={roomDyn['DoorStyle'] || ''} 
+                                                                    onChange={(v: string) => updateRoomDynamicSelection(roomName, 'DoorStyle', v)} 
+                                                                />
+                                                            );
+                                                        })()}
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                             </div>
+                        )
+                    }
+                })()}
              </div>
         )}
         
@@ -1758,7 +1897,20 @@ export const QuotationFlow: React.FC = () => {
                             });
 
                             // 3. Render Cabinet Groups
-                            const cabinetSections = Object.entries(groups).map(([roomName, roomItems]) => {
+                            // SORTED BY PAGE NUMBER (Min Page of items in group)
+                            const sortedRoomEntries = Object.entries(groups).sort((a, b) => {
+                                const [nameA, itemsA] = a;
+                                const [nameB, itemsB] = b;
+                                
+                                // Get min page for each room
+                                const minPageA = Math.min(...itemsA.map(i => (i as any).sourcePage || 999));
+                                const minPageB = Math.min(...itemsB.map(i => (i as any).sourcePage || 999));
+                                
+                                if (minPageA !== minPageB) return minPageA - minPageB;
+                                return nameA.localeCompare(nameB);
+                            });
+
+                            const cabinetSections = sortedRoomEntries.map(([roomName, roomItems]) => {
                                 // Sub-Grouping Logic (Same as PDF)
                                 const categorized: Record<string, PricingLineItem[]> = {};
                                 const roomLower = roomName.toLowerCase();
@@ -1767,7 +1919,10 @@ export const QuotationFlow: React.FC = () => {
                                     let cat = item.type as string;
                                     
                                     // Map Types to Display Categories
-                                    if (cat === 'Base') {
+                                    if (cat === 'Vanity') {
+                                        cat = 'Vanity Cabinets';
+                                    }
+                                    else if (cat === 'Base') {
                                         cat = (roomLower.includes('bath') || roomLower.includes('vanity') || roomLower.includes('ensuite') || roomLower.includes('powder')) 
                                             ? 'Vanity Cabinets' 
                                             : 'Base Cabinets';
@@ -1775,7 +1930,8 @@ export const QuotationFlow: React.FC = () => {
                                     else if (cat === 'Wall') cat = 'Wall Cabinets';
                                     else if (cat === 'Tall') cat = 'Tall Cabinets';
                                     else if (cat === 'Hardware') cat = 'Hinges & Hardware';
-                                    else if (cat === 'Finishing' || cat === 'Panel' || cat === 'Filler') cat = 'Finishing, Panels & Fillers';
+                                    else if (cat === 'Filler') cat = 'Fillers';
+                                    else if (cat === 'Finishing' || cat === 'Panel') cat = 'Finishing & Panels';
                                     else if (cat === 'Appliance') cat = 'Appliances';
                                     else if (cat === 'Accessory') cat = 'Accessories';
                                     else if (cat === 'Modification') cat = 'Modifications';
@@ -1790,10 +1946,11 @@ export const QuotationFlow: React.FC = () => {
                                     'Base Cabinets', 
                                     'Vanity Cabinets', 
                                     'Tall Cabinets', 
+                                    'Fillers',
+                                    'Finishing & Panels',
+                                    'Hinges & Hardware', 
                                     'Appliances', 
                                     'Accessories', 
-                                    'Hinges & Hardware', 
-                                    'Finishing, Panels & Fillers', 
                                     'Modifications'
                                 ];
 
@@ -2113,12 +2270,21 @@ export const QuotationFlow: React.FC = () => {
 
                                                  <div className="flex justify-between text-sm mb-2"><span className="text-slate-500">Sell Price Subtotal:</span><span className="font-medium">${sellTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>
                                                  {financials.discountRate > 0 && <div className="flex justify-between text-sm mb-2"><span className="text-slate-500">Add'l Discount ({financials.discountRate}%):</span><span className="font-medium text-red-600">- ${discountAmount.toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>}
-                                                 <div className="flex justify-between text-sm mb-2"><span className="text-slate-500">Net Sell Price:</span><span className="font-medium">${postDiscount.toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>
-                                                 {financials.taxRate > 0 && <div className="flex justify-between text-sm mb-2"><span className="text-slate-500">Tax ({financials.taxRate}%):</span><span className="font-medium">${taxAmount.toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>}
-                                                 {(financials.shippingCost > 0 || financials.fuelSurcharge > 0 || financials.miscCharge > 0) && (
-                                                     <div className="flex justify-between text-sm mb-2"><span className="text-slate-500">Fees:</span><span className="font-medium">${(financials.shippingCost + financials.fuelSurcharge + financials.miscCharge).toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>
+                                                 
+                                                 {/* Actual Price (Product Only) */}
+                                                 <div className="flex justify-between text-sm mb-2 pt-2 border-t border-slate-100 font-bold text-slate-700"><span className="">Actual Price:</span><span className="">${postDiscount.toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>
+                                                 
+                                                 {/* Fees & Taxes Section */}
+                                                 {(financials.taxRate > 0 || financials.shippingCost > 0 || financials.fuelSurcharge > 0 || financials.miscCharge > 0) && (
+                                                     <div className="my-3 py-2 bg-slate-50 rounded px-2 text-xs space-y-1 border border-slate-100">
+                                                         {financials.taxRate > 0 && <div className="flex justify-between text-slate-500"><span>Tax ({financials.taxRate}%):</span><span>${taxAmount.toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>}
+                                                         {financials.shippingCost > 0 && <div className="flex justify-between text-slate-500"><span>Shipping:</span><span>${financials.shippingCost.toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>}
+                                                         {financials.fuelSurcharge > 0 && <div className="flex justify-between text-slate-500"><span>Fuel Surcharge:</span><span>${financials.fuelSurcharge.toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>}
+                                                         {financials.miscCharge > 0 && <div className="flex justify-between text-slate-500"><span>Misc Charges:</span><span>${financials.miscCharge.toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>}
+                                                     </div>
                                                  )}
-                                                 <div className="flex justify-between text-base font-bold text-slate-900 mt-3 pt-3 border-t border-slate-200"><span>Grand Total:</span><span>${grandTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>
+
+                                                 <div className="flex justify-between text-xl font-extrabold text-brand-700 mt-3 pt-3 border-t-2 border-slate-200"><span>Grand Total:</span><span>${grandTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>
                                              </>
                                          );
                                      })()}

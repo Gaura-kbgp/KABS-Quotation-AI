@@ -1,6 +1,6 @@
 
 
-export type CabinetType = 'Base' | 'Wall' | 'Tall' | 'Panel' | 'Filler' | 'Accessory' | 'Modification' | 'Appliance' | 'Hardware' | 'Finishing';
+export type CabinetType = 'Base' | 'Wall' | 'Tall' | 'Vanity' | 'Panel' | 'Filler' | 'Accessory' | 'Modification' | 'Appliance' | 'Hardware' | 'Finishing';
 
 export interface CabinetModification {
   description: string;
@@ -202,6 +202,7 @@ export interface Project {
   status: 'Draft' | 'Quoted' | 'Ordered';
   items: CabinetItem[];
   specs?: ProjectSpecs;
+  roomSpecs?: Record<string, ProjectSpecs>; // NEW: Per-Room Specs
   manufacturerId?: string;
   pricing?: PricingLineItem[];
   selectedTierId?: string;
