@@ -1,0 +1,1 @@
+feat: Update dependencies, fix build errors, and add git initialization
